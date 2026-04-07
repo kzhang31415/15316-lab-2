@@ -11,15 +11,20 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
 
 1. direct explicit flow (`return secret;`)
 2. implicit-flow boolean oracle (`if (secret < input) ...`)
-3. abort channel oracles (multiple templates):
+3. expression-level abort oracles (short-circuit `&&` templates):
+   - guarded divide-by-zero
+   - guarded modulo-by-zero
+   - guarded out-of-bounds read
+4. abort channel oracles (statement templates):
    - `error(...)`
    - `assert(...)`
    - divide-by-zero
    - modulo-by-zero
    - out-of-bounds read
-4. nontermination channel oracles (two loop templates)
-5. timing channel oracle with adaptive calibration:
+5. nontermination channel oracles (two loop templates)
+6. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
+   - also tries a short-circuit expression timing template
    - uses a `//@label H` accumulator to avoid low-write implicit-flow rejection
    - checks baseline vs. high-input separation
    - uses repeated median measurements and majority voting

