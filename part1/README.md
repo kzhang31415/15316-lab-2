@@ -75,6 +75,8 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
   then scales timing timeout accordingly.
 - Any recovered candidate is re-verified against the server using `return input;`
   (including nearby off-by-one candidates) before writing `flow_serve<n>.txt`.
+- Timing-derived candidates require repeated verification passes before being
+  accepted, to reduce false positives from noisy measurements.
 - Some servers reject nearly all nontrivial programs as `insecure`; in that case
   the harness reports those channels quickly and focuses on probes that still parse
   and execute.
