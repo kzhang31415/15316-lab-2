@@ -73,8 +73,10 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
   example to `5`) and possibly `--timing-timeout`.
 - The harness also auto-calibrates per-server timeouts from a no-op baseline,
   then scales timing timeout accordingly.
-- Any recovered candidate is re-verified against the server using `return input;`
-  (including nearby off-by-one candidates) before writing `flow_serve<n>.txt`.
+- Any recovered candidate is re-verified before writing `flow_serve<n>.txt`.
+  The verifier first tries a constant-return checker (`return <candidate>;`) and
+  falls back to `return input;` if needed; nearby off-by-one candidates are also
+  checked.
 - Timing-derived candidates now require stronger confidence checks before they
   are accepted: boundary consistency voting plus repeated exact-match
   verification passes.
