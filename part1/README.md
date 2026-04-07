@@ -16,8 +16,9 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
    - guarded modulo-by-zero
    - guarded out-of-bounds read
    - int-cast guards (`int gate = secret < input; 1 / gate`)
-4. bitwise abort oracle:
+4. bitwise abort oracles:
    - reads each secret bit via expression-driven abort behavior
+   - includes classic arithmetic and expression-guarded variants
    - reconstructs a 62-bit candidate and verifies by exact-match query
 5. abort channel oracles (statement templates):
    - `error(...)`
@@ -74,3 +75,6 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
   then scales timing timeout accordingly.
 - Any recovered candidate is re-verified against the server using `return input;`
   (including nearby off-by-one candidates) before writing `flow_serve<n>.txt`.
+- Some servers reject nearly all nontrivial programs as `insecure`; in that case
+  the harness reports those channels quickly and focuses on probes that still parse
+  and execute.
