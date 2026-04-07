@@ -11,18 +11,22 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
 
 1. direct explicit flow (`return secret;`)
 2. implicit-flow boolean oracle (`if (secret < input) ...`)
-3. expression-level abort oracles (short-circuit `&&` templates):
+3. expression-level abort oracles (short-circuit/int-cast templates):
    - guarded divide-by-zero
    - guarded modulo-by-zero
    - guarded out-of-bounds read
-4. abort channel oracles (statement templates):
+   - int-cast guards (`int gate = secret < input; 1 / gate`)
+4. bitwise abort oracle:
+   - reads each secret bit via expression-driven abort behavior
+   - reconstructs a 62-bit candidate and verifies by exact-match query
+5. abort channel oracles (statement templates):
    - `error(...)`
    - `assert(...)`
    - divide-by-zero
    - modulo-by-zero
    - out-of-bounds read
-5. nontermination channel oracles (two loop templates)
-6. timing channel oracle with adaptive calibration:
+6. nontermination channel oracles (two loop templates)
+7. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
    - also tries a short-circuit expression timing template
    - uses a `//@label H` accumulator to avoid low-write implicit-flow rejection
@@ -68,3 +72,5 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
   example to `5`) and possibly `--timing-timeout`.
 - The harness also auto-calibrates per-server timeouts from a no-op baseline,
   then scales timing timeout accordingly.
+- Any recovered candidate is re-verified against the server using `return input;`
+  (including nearby off-by-one candidates) before writing `flow_serve<n>.txt`.
