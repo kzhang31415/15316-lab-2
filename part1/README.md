@@ -20,14 +20,19 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
    - reads each secret bit via expression-driven abort behavior
    - includes classic arithmetic and expression-guarded variants
    - reconstructs a 62-bit candidate and verifies by exact-match query
-5. abort channel oracles (statement templates):
+5. strict expression fuzz suite (strict-policy mode):
+   - enumerates many expression forms around `&&`/`||`, guard polarity/order,
+     and arithmetic/OOB payloads
+   - auto-detects informative endpoint behavior and upgrades to binary-search
+     oracle recovery when possible
+6. abort channel oracles (statement templates):
    - `error(...)`
    - `assert(...)`
    - divide-by-zero
    - modulo-by-zero
    - out-of-bounds read
-6. nontermination channel oracles (two loop templates)
-7. timing channel oracle with adaptive calibration:
+7. nontermination channel oracles (two loop templates)
+8. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
    - also tries a short-circuit expression timing template
    - uses a `//@label H` accumulator to avoid low-write implicit-flow rejection
