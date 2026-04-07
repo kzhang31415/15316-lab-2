@@ -1,0 +1,5 @@
+// Expect: insecure
+int main(int input, int secret)
+{
+    return secret;
+}

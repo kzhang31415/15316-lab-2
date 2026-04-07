@@ -1,0 +1,8 @@
+// Expect: secure
+int main(int input, int secret)
+{
+    //@label H;
+    int h = secret + 1;
+    int result = input * 2;
+    return result;
+}

@@ -1,0 +1,5 @@
+// Expect: error
+int main(int input, int secret)
+{
+    int x = input + 1;
+}

@@ -1,0 +1,11 @@
+// Expect: insecure
+int main(int input, int secret)
+{
+    int x = 0;
+    if (secret > 0) {
+        x = 1;
+    } else {
+        x = 0;
+    }
+    return x;
+}

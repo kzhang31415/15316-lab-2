@@ -1,0 +1,6 @@
+// Expect: secure
+int main(int input, int secret)
+{
+    int x = input + 1;
+    return x;
+}
