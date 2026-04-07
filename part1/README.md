@@ -11,9 +11,17 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
 
 1. direct explicit flow (`return secret;`)
 2. implicit-flow boolean oracle (`if (secret < input) ...`)
-3. abort channel oracle (`error(...)` under secret-dependent branch)
-4. nontermination channel oracle (infinite loop under secret-dependent branch)
-5. timing channel oracle (secret-dependent extra work + median timing)
+3. abort channel oracles (multiple templates):
+   - `error(...)`
+   - `assert(...)`
+   - divide-by-zero
+   - modulo-by-zero
+   - out-of-bounds read
+4. nontermination channel oracles (two loop templates)
+5. timing channel oracle with adaptive calibration:
+   - tries several burn-loop sizes
+   - checks baseline vs. high-input separation
+   - uses repeated median measurements and majority voting
 
 If a strategy recovers a secret, the script writes:
 
@@ -41,12 +49,14 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
 
 - `--servers 1 3 4` attack only a subset
 - `--query-timeout 1.2` timeout (seconds) for non-timing probes
-- `--timing-timeout 8.0` timeout (seconds) for timing probes
+- `--timing-timeout 12.0` timeout (seconds) for timing probes
 - `--timing-repeats 3` repeated timing samples per probe (median used)
+- `--debug` print per-strategy diagnostics explaining why a strategy was rejected
 
 ### Notes
 
 - The script exits with code `0` only when all requested servers are recovered.
 - If one server is intentionally secure, unresolved servers are reported and the
   script exits nonzero so you can investigate manually.
-- If timing is noisy on a shared machine, increase `--timing-repeats`.
+- If timing is noisy on a shared machine, increase `--timing-repeats` (for
+  example to `5`) and possibly `--timing-timeout`.
