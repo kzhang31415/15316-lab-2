@@ -20,6 +20,7 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
 4. nontermination channel oracles (two loop templates)
 5. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
+   - uses a `//@label H` accumulator to avoid low-write implicit-flow rejection
    - checks baseline vs. high-input separation
    - uses repeated median measurements and majority voting
 
@@ -60,3 +61,5 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
   script exits nonzero so you can investigate manually.
 - If timing is noisy on a shared machine, increase `--timing-repeats` (for
   example to `5`) and possibly `--timing-timeout`.
+- The harness also auto-calibrates per-server timeouts from a no-op baseline,
+  then scales timing timeout accordingly.

