@@ -35,9 +35,9 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
 8. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
    - also tries a short-circuit expression timing template
-   - uses a `//@label H` accumulator to avoid low-write implicit-flow rejection
+   - includes a strict-friendly, secret-gated allocation-timing template
    - checks baseline vs. high-input separation
-   - uses repeated median measurements and majority voting
+   - uses repeated median measurements and stronger majority voting
 
 If a strategy recovers a secret, the script writes:
 
