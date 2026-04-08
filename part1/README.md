@@ -34,10 +34,12 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
 7. nontermination channel oracles (two loop templates)
 8. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
-   - also tries a short-circuit expression timing template
+   - also tries a secret-arithmetic short-circuit timing template
    - includes a strict-friendly, secret-gated allocation-timing template
    - checks baseline vs. high-input separation
    - uses repeated median measurements and stronger majority voting
+   - if a timing probe is rejected but endpoint result kinds differ, it
+     opportunistically upgrades to a kind-oracle binary search
 
 If a strategy recovers a secret, the script writes:
 
