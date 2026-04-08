@@ -974,11 +974,15 @@ def recover_from_timing_oracle(
 ) -> int:
     def timing_input_for(mid: int, candidate_name: str) -> int:
         if candidate_name.startswith("alloc-timing-"):
-            # Avoid huge allocation sizes during boundary/binary-search probes.
-            # Preserve endpoint ordering (0 -> low, max -> high) while bounding input.
+            # Avoid huge allocation sizes during boundary/binary-search probes, while
+            # preserving monotonic ordering of attacker inputs.
+            max_safe_input = 1 << 20
             if mid <= SECRET_MIN:
                 return 0
-            return 1 << 20
+            if mid >= SECRET_MAX_EXCLUSIVE:
+                return max_safe_input
+            mapped = (mid * max_safe_input) // SECRET_MAX_EXCLUSIVE
+            return max(1, mapped)
         return mid
 
     calibration_repeats = max(5, repeats)
@@ -1105,12 +1109,8 @@ def recover_from_timing_oracle(
                     return True, frac_true
                 return False, 1.0 - frac_true
 
-            boundary_lo, conf_lo = boundary_vote(
-                timing_input_for(SECRET_MIN, candidate_name), boundary_checks
-            )
-            boundary_hi, conf_hi = boundary_vote(
-                timing_input_for(SECRET_MAX_EXCLUSIVE, candidate_name), boundary_checks
-            )
+            boundary_lo, conf_lo = boundary_vote(SECRET_MIN, boundary_checks)
+            boundary_hi, conf_hi = boundary_vote(SECRET_MAX_EXCLUSIVE, boundary_checks)
             if conf_lo < min_boundary_consistency or conf_hi < min_boundary_consistency:
                 last_failure = (
                     "timing boundary too noisy "
