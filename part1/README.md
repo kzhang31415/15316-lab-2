@@ -68,8 +68,8 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
 - `--timing-timeout 12.0` timeout (seconds) for timing probes
 - `--timing-repeats 3` repeated timing samples per probe (median used)
 - `--debug` print per-strategy diagnostics explaining why a strategy was rejected
-- `--deep` enable a slower, broader strict-mode search (more fuzz probes and
-  deeper strict-policy exploration)
+- `--deep` enable a slower, broader strict-mode search (more fuzz probes, no
+  early-stop in strict fuzz, and deeper strict-policy exploration)
 
 ### Notes
 
@@ -90,3 +90,6 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
 - Some servers reject nearly all nontrivial programs as `insecure`; in that case
   the harness reports those channels quickly and focuses on probes that still parse
   and execute.
+- In strict-policy mode, the harness now also tries a dedicated bitwise template
+  set before timing to catch arithmetic abort/failure behavior that generic fuzzing
+  can miss.
