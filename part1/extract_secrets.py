@@ -809,6 +809,7 @@ def recover_from_strict_expr_fuzz_suite(
     timeout_s: float,
     debug: bool,
     max_probes: int = 64,
+    early_break_enabled: bool = True,
 ) -> int:
     programs = iter_strict_expr_fuzz_programs()
     tested = 0
@@ -890,11 +891,29 @@ def recover_from_strict_expr_fuzz_suite(
 
         # Fast-fail in strict mode when many probes yield no endpoint signal.
         no_signal_streak += 1
-        if tested >= 24 and no_signal_streak >= 24:
+        if early_break_enabled and tested >= 24 and no_signal_streak >= 24:
             break
 
     raise StrategyFailed(
         f"strict expr-fuzz found no usable oracle (tested={tested}, informative={informative})"
+    )
+
+
+def recover_from_strict_expr_fuzz_deep(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+    debug: bool,
+) -> int:
+    # Deep strict search should not fast-break after an initial no-signal streak.
+    return recover_from_strict_expr_fuzz_suite(
+        server_command=server_command,
+        userid=userid,
+        timeout_s=timeout_s,
+        debug=debug,
+        max_probes=420,
+        early_break_enabled=False,
     )
 
 
@@ -1717,6 +1736,16 @@ def recover_server_secret(
                 timeout_s=tuned_query_timeout,
                 debug=debug,
                 max_probes=220 if deep else 24,
+                early_break_enabled=not deep,
+            ),
+        ),
+        (
+            "strict bitwise templates",
+            lambda: recover_from_strict_bitwise_templates(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                debug=debug,
             ),
         ),
         (
@@ -1733,7 +1762,7 @@ def recover_server_secret(
     ]
     # Deep mode: spend more effort on strict-policy servers where most probes
     # are rejected as insecure, to increase chances of finding one cracked server.
-    if strict_policy_mode and timing_repeats >= 5:
+    if strict_policy_mode and deep:
         strict_mode_strategies.insert(
             1,
             (
@@ -1744,6 +1773,7 @@ def recover_server_secret(
                     timeout_s=tuned_query_timeout,
                     debug=debug,
                     max_probes=420,
+                    early_break_enabled=False,
                 ),
             ),
         )
