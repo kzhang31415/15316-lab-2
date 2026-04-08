@@ -25,14 +25,17 @@ available on the CMU `linux.andrew.cmu.edu` machines, run this tool there.
      and arithmetic/OOB payloads
    - auto-detects informative endpoint behavior and upgrades to binary-search
      oracle recovery when possible
-6. abort channel oracles (statement templates):
+6. strict error-kind suite (strict-policy mode):
+   - targets servers that surface runtime-fault channels as `error` (instead of `abort`)
+   - tries int-cast / bool-cmp / index templates and recovers via kind-oracle search
+7. abort channel oracles (statement templates):
    - `error(...)`
    - `assert(...)`
    - divide-by-zero
    - modulo-by-zero
    - out-of-bounds read
-7. nontermination channel oracles (two loop templates)
-8. timing channel oracle with adaptive calibration:
+8. nontermination channel oracles (two loop templates)
+9. timing channel oracle with adaptive calibration:
    - tries several burn-loop sizes
    - also tries a secret-arithmetic short-circuit timing template
    - includes a strict-friendly, secret-gated allocation-timing template

@@ -729,7 +729,7 @@ def recover_from_strict_expr_abort_suite(
                 userid=userid,
                 timeout_s=timeout_s,
                 program_source=source,
-                true_kinds={"abort"},
+                true_kinds={"abort", "error"},
                 false_kinds={"failure"},
             )
         except StrategyFailed as e:
@@ -741,6 +741,63 @@ def recover_from_strict_expr_abort_suite(
                     f"strict expr-abort probes non-informative ({probe_name} always-abort endpoints)"
                 ) from e
             last_error = f"{probe_name}: {msg}"
+    raise StrategyFailed(last_error)
+
+
+def recover_from_strict_error_kind_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+) -> int:
+    # Some strict servers surface runtime faults as "error" (not "abort").
+    probes = [
+        ("int-cast div", EXPR_INTCAST_DIV_ORACLE_PROGRAM),
+        ("int-cast mod", EXPR_INTCAST_MOD_ORACLE_PROGRAM),
+        ("int-cast div rev", EXPR_INTCAST_DIV_REV_ORACLE_PROGRAM),
+        ("bool-cmp div", EXPR_DIV_BOOL_CMP_ORACLE_PROGRAM),
+        ("bool-cmp mod", EXPR_MOD_BOOL_CMP_ORACLE_PROGRAM),
+        ("index-bool", EXPR_INDEX_BOOL_ORACLE_PROGRAM),
+        ("index-bool rev", EXPR_INDEX_BOOL_REV_ORACLE_PROGRAM),
+    ]
+    last_error = "strict error-kind suite did not produce a usable oracle"
+    for probe_name, source in probes:
+        try:
+            return recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=source,
+                true_kinds={"abort", "error"},
+                false_kinds={"failure"},
+            )
+        except StrategyFailed as e:
+            last_error = f"{probe_name}: {e}"
+    raise StrategyFailed(last_error)
+
+
+def recover_from_strict_compare_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+) -> int:
+    probes = [
+        ("compare-as-int", COMPARE_AS_INT_ORACLE_PROGRAM),
+        ("compare-as-int tmp", COMPARE_AS_INT_TMP_ORACLE_PROGRAM),
+        ("compare-as-int rev", COMPARE_AS_INT_REV_ORACLE_PROGRAM),
+    ]
+    last_error = "strict compare suite did not produce a usable oracle"
+    for probe_name, source in probes:
+        try:
+            return recover_from_failure_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=source,
+            )
+        except StrategyFailed as e:
+            last_error = f"{probe_name}: {e}"
     raise StrategyFailed(last_error)
 
 
@@ -1190,6 +1247,12 @@ def recover_from_timing_oracle(
                     and res_hi.kind in {"failure", "abort", "error"}
                     and res_lo.kind != res_hi.kind
                 ):
+                    true_kinds = {res_hi.kind}
+                    false_kinds = {res_lo.kind}
+                    if "error" in true_kinds:
+                        true_kinds.add("abort")
+                    if "error" in false_kinds:
+                        false_kinds.add("abort")
                     debug_log(
                         debug,
                         f"[timing] {candidate_name}: falling back to kind oracle "
@@ -1201,8 +1264,8 @@ def recover_from_timing_oracle(
                             userid=userid,
                             timeout_s=timeout_s,
                             program_source=source,
-                            true_kinds={res_hi.kind},
-                            false_kinds={res_lo.kind},
+                            true_kinds=true_kinds,
+                            false_kinds=false_kinds,
                         )
                     except StrategyFailed:
                         pass
@@ -1665,6 +1728,14 @@ def recover_server_secret(
                 debug=debug,
                 max_probes=24,
                 early_break_enabled=True,
+            ),
+        ),
+        (
+            "strict error-kind suite",
+            lambda: recover_from_strict_error_kind_suite(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
             ),
         ),
         (
