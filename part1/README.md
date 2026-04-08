@@ -68,6 +68,8 @@ This attempts servers 1..5 by default and writes `flow_serve<n>.txt` files in `.
 - `--timing-timeout 12.0` timeout (seconds) for timing probes
 - `--timing-repeats 3` repeated timing samples per probe (median used)
 - `--debug` print per-strategy diagnostics explaining why a strategy was rejected
+- `--deep` enable a slower, broader strict-mode search (more fuzz probes and
+  deeper strict-policy exploration)
 
 ### Notes
 

