@@ -10,11 +10,12 @@ clean:
 
 SRC_DIRS := ./src
 VENDOR_DIRS := ./vendor
+GITIGNORE_FILE := $(shell test -f .gitignore && echo .gitignore)
 
 FILES := \
 	Makefile \
 	requirements.txt \
-	.gitignore \
+	$(GITIGNORE_FILE) \
 	c0_serve.sh \
 	$(shell find $(SRC_DIRS) -name '*.py') \
 	$(shell test -d $(VENDOR_DIRS) && find $(VENDOR_DIRS) -type f)
