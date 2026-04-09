@@ -259,6 +259,12 @@ class StrategyFailed(Exception):
     pass
 
 
+class RecoveredSecret(Exception):
+    def __init__(self, secret: int):
+        super().__init__(f"recovered secret {secret}")
+        self.secret = secret
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -655,21 +661,27 @@ def recover_from_failure_oracle(
                 timeout_s=timeout_s,
             )
             if res.kind == "success" and res.value is not None:
-                raise StrategyFailed(f"already solved directly: {res.value}")
+                raise RecoveredSecret(res.value)
             if res.kind == "failure" and res.value in (0, 1):
                 return res.value == 1
             raise StrategyFailed(f"oracle unavailable ({format_result(res)})")
 
-        boundary_lo = classify(SECRET_MIN)
-        boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+        try:
+            boundary_lo = classify(SECRET_MIN)
+            boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+        except RecoveredSecret as solved:
+            return solved.secret
         if boundary_lo == boundary_hi:
             raise StrategyFailed(
                 "boolean-oracle boundary check failed "
                 f"(at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
             )
-        if (not boundary_lo) and boundary_hi:
-            return binary_search_oracle(classify)
-        return binary_search_oracle(lambda mid: not classify(mid))
+        try:
+            if (not boundary_lo) and boundary_hi:
+                return binary_search_oracle(classify)
+            return binary_search_oracle(lambda mid: not classify(mid))
+        except RecoveredSecret as solved:
+            return solved.secret
 
 
 def recover_from_kind_oracle(
@@ -691,23 +703,29 @@ def recover_from_kind_oracle(
                 timeout_s=timeout_s,
             )
             if res.kind == "success" and res.value is not None:
-                raise StrategyFailed(f"already solved directly: {res.value}")
+                raise RecoveredSecret(res.value)
             if res.kind in true_kinds:
                 return True
             if res.kind in false_kinds:
                 return False
             raise StrategyFailed(f"oracle unavailable ({format_result(res)})")
 
-        boundary_lo = classify(SECRET_MIN)
-        boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+        try:
+            boundary_lo = classify(SECRET_MIN)
+            boundary_hi = classify(SECRET_MAX_EXCLUSIVE)
+        except RecoveredSecret as solved:
+            return solved.secret
         if boundary_lo == boundary_hi:
             raise StrategyFailed(
                 "kind-oracle boundary check failed "
                 f"(at 0 => {boundary_lo}, at 2^62 => {boundary_hi})"
             )
-        if (not boundary_lo) and boundary_hi:
-            return binary_search_oracle(classify)
-        return binary_search_oracle(lambda mid: not classify(mid))
+        try:
+            if (not boundary_lo) and boundary_hi:
+                return binary_search_oracle(classify)
+            return binary_search_oracle(lambda mid: not classify(mid))
+        except RecoveredSecret as solved:
+            return solved.secret
 
 
 def recover_from_strict_expr_abort_suite(
@@ -1198,7 +1216,7 @@ def median_runtime_for_input(
             timeout_s=timeout_s,
         )
         if res.kind == "success" and res.value is not None:
-            raise StrategyFailed(f"already solved directly: {res.value}")
+            raise RecoveredSecret(res.value)
         if res.kind != "failure":
             raise StrategyFailed(f"timing probe rejected ({format_result(res)})")
         runtimes.append(res.elapsed_s)
@@ -1320,6 +1338,8 @@ def recover_from_timing_oracle(
                     timeout_s=timeout_s,
                     repeats=calibration_repeats,
                 )
+            except RecoveredSecret as solved:
+                return solved.secret
             except StrategyFailed as e:
                 last_failure = str(e)
                 debug_log(debug, f"[timing] {candidate_name}: {last_failure}")
