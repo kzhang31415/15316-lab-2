@@ -28,6 +28,30 @@ def check_secure(prog: c0.Program) -> bool:
             return HIGH
         return LOW
 
+    def int_const_value(exp: c0.Exp) -> int | None:
+        match exp:
+            case c0.IntConst(v):
+                return v
+            case c0.UnOp("-", arg):
+                v = int_const_value(arg)
+                if v is None:
+                    return None
+                return -v
+            case _:
+                return None
+
+    def bool_const_value(exp: c0.Exp) -> bool | None:
+        match exp:
+            case c0.BoolConst(v):
+                return v
+            case c0.UnOp("!", arg):
+                v = bool_const_value(arg)
+                if v is None:
+                    return None
+                return not v
+            case _:
+                return None
+
     class TypeErrorIFC(Exception):
         pass
 
@@ -108,9 +132,14 @@ def check_secure(prog: c0.Program) -> bool:
                     abort_label = join(a_l, a_r)
                     may_abort = m_l or m_r
                     if op in {"/", "%"}:
-                        # Division/modulo may abort when divisor is 0.
-                        abort_label = join(abort_label, l_r)
-                        may_abort = True
+                        divisor = int_const_value(right)
+                        if divisor is None:
+                            # Division/modulo may abort when divisor is 0.
+                            abort_label = join(abort_label, l_r)
+                            may_abort = True
+                        elif divisor == 0:
+                            # Definite abort, independent of high data in divisor value.
+                            may_abort = True
                     return (c0.IntType(), val_label, abort_label, may_abort)
 
                 if op in cmp_ops:
@@ -233,7 +262,13 @@ def check_secure(prog: c0.Program) -> bool:
                 if not isinstance(t_cond, c0.BoolType):
                     raise TypeErrorIFC("assert condition must be bool")
                 # assert may abort when cond is false.
-                require_flows(join(pc, l_cond, a_cond), LOW)
+                cond_const = bool_const_value(cond)
+                assert_may_abort = _m_cond or (cond_const is not True)
+                if assert_may_abort:
+                    abort_label = a_cond
+                    if cond_const is not True:
+                        abort_label = join(abort_label, l_cond)
+                    require_flows(join(pc, abort_label), LOW)
 
             case c0.Error(_msg):
                 # error always aborts; only safe when not control-dependent on high data.
