@@ -801,6 +801,104 @@ def recover_from_strict_compare_suite(
     raise StrategyFailed(last_error)
 
 
+def recover_from_strict_kind_split_suite(
+    *,
+    server_command: str,
+    userid: str,
+    timeout_s: float,
+    debug: bool,
+) -> int:
+    # Probe a broad family and opportunistically turn endpoint kind differences
+    # into a binary-search oracle. This catches servers that distinguish outcomes
+    # with non-standard kind pairs (for example, failure vs insecure).
+    probes = [
+        ("compare-as-int", COMPARE_AS_INT_ORACLE_PROGRAM),
+        ("compare-as-int tmp", COMPARE_AS_INT_TMP_ORACLE_PROGRAM),
+        ("compare-as-int rev", COMPARE_AS_INT_REV_ORACLE_PROGRAM),
+        ("implicit bool", IMPLICIT_BOOLEAN_PROGRAM),
+        ("expr && div0", EXPR_ABORT_AND_DIVZERO_ORACLE_PROGRAM),
+        ("expr && mod0", EXPR_ABORT_AND_MODZERO_ORACLE_PROGRAM),
+        ("expr && oob", EXPR_ABORT_AND_OOB_ORACLE_PROGRAM),
+        ("int-cast div", EXPR_INTCAST_DIV_ORACLE_PROGRAM),
+        ("int-cast mod", EXPR_INTCAST_MOD_ORACLE_PROGRAM),
+        ("int-cast div rev", EXPR_INTCAST_DIV_REV_ORACLE_PROGRAM),
+        ("index bool", EXPR_INDEX_BOOL_ORACLE_PROGRAM),
+        ("index bool rev", EXPR_INDEX_BOOL_REV_ORACLE_PROGRAM),
+        ("abort error", ABORT_ERROR_ORACLE_PROGRAM),
+        ("abort assert", ABORT_ASSERT_ORACLE_PROGRAM),
+        ("abort div0", ABORT_DIVZERO_ORACLE_PROGRAM),
+        ("abort mod0", ABORT_MODZERO_ORACLE_PROGRAM),
+        ("abort oob", ABORT_OOB_ORACLE_PROGRAM),
+        ("termination", TERMINATION_ORACLE_PROGRAM),
+        ("termination alt", TERMINATION_ORACLE_ALT_PROGRAM),
+    ]
+    informative_kinds = {"failure", "abort", "error", "insecure", "timeout"}
+    last_error = "strict kind-split suite found no usable endpoint kind split"
+
+    for probe_name, source in probes:
+        with ProgramFile(source) as path:
+            res_lo = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=SECRET_MIN,
+                timeout_s=timeout_s,
+            )
+            res_hi = run_query(
+                server_command=server_command,
+                userid=userid,
+                program_path=path,
+                input_value=SECRET_MAX_EXCLUSIVE,
+                timeout_s=timeout_s,
+            )
+
+        if res_lo.kind == "success" and res_lo.value is not None:
+            return res_lo.value
+        if res_hi.kind == "success" and res_hi.value is not None:
+            return res_hi.value
+        if res_lo.kind == res_hi.kind:
+            last_error = (
+                f"{probe_name}: non-informative endpoints "
+                f"(lo={res_lo.kind}, hi={res_hi.kind})"
+            )
+            continue
+        if res_lo.kind not in informative_kinds or res_hi.kind not in informative_kinds:
+            last_error = (
+                f"{probe_name}: unsupported endpoint kind pair "
+                f"(lo={res_lo.kind}, hi={res_hi.kind})"
+            )
+            continue
+
+        true_kinds = {res_hi.kind}
+        false_kinds = {res_lo.kind}
+
+        # Treat runtime-fault families similarly when one side reports "error".
+        if "error" in true_kinds and "abort" not in false_kinds:
+            true_kinds.add("abort")
+        if "error" in false_kinds and "abort" not in true_kinds:
+            false_kinds.add("abort")
+
+        debug_log(
+            debug,
+            f"[strict-kind-split] {probe_name}: trying oracle "
+            f"(lo={res_lo.kind} => False, hi={res_hi.kind} => True)",
+        )
+        try:
+            return recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=timeout_s,
+                program_source=source,
+                true_kinds=true_kinds,
+                false_kinds=false_kinds,
+            )
+        except StrategyFailed as e:
+            last_error = f"{probe_name}: {e}"
+            continue
+
+    raise StrategyFailed(last_error)
+
+
 def make_strict_expr_fuzz_program(
     *,
     guard: str,
@@ -898,8 +996,8 @@ def recover_from_strict_expr_fuzz_suite(
 
         # Informative kind oracle candidate
         if (
-            res_lo.kind in {"abort", "failure"}
-            and res_hi.kind in {"abort", "failure"}
+            res_lo.kind in {"abort", "error", "failure", "insecure", "timeout"}
+            and res_hi.kind in {"abort", "error", "failure", "insecure", "timeout"}
             and res_lo.kind != res_hi.kind
         ):
             informative += 1
@@ -909,14 +1007,20 @@ def recover_from_strict_expr_fuzz_suite(
                 f"[strict-fuzz] informative kind probe {name}: "
                 f"lo={res_lo.kind} hi={res_hi.kind}",
             )
+            true_kinds = {res_hi.kind}
+            false_kinds = {res_lo.kind}
+            if "error" in true_kinds and "abort" not in false_kinds:
+                true_kinds.add("abort")
+            if "error" in false_kinds and "abort" not in true_kinds:
+                false_kinds.add("abort")
             try:
                 return recover_from_kind_oracle(
                     server_command=server_command,
                     userid=userid,
                     timeout_s=timeout_s,
                     program_source=source,
-                    true_kinds={res_hi.kind},
-                    false_kinds={res_lo.kind},
+                    true_kinds=true_kinds,
+                    false_kinds=false_kinds,
                 )
             except StrategyFailed:
                 pass
@@ -1731,11 +1835,28 @@ def recover_server_secret(
             ),
         ),
         (
+            "strict compare suite",
+            lambda: recover_from_strict_compare_suite(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+            ),
+        ),
+        (
             "strict error-kind suite",
             lambda: recover_from_strict_error_kind_suite(
                 server_command=server_command,
                 userid=userid,
                 timeout_s=tuned_query_timeout,
+            ),
+        ),
+        (
+            "strict kind-split suite",
+            lambda: recover_from_strict_kind_split_suite(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                debug=debug,
             ),
         ),
         (
@@ -1745,6 +1866,28 @@ def recover_server_secret(
                 userid=userid,
                 timeout_s=tuned_query_timeout,
                 debug=debug,
+            ),
+        ),
+        (
+            "nontermination oracle",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=TERMINATION_ORACLE_PROGRAM,
+                true_kinds={"timeout"},
+                false_kinds={"failure", "insecure"},
+            ),
+        ),
+        (
+            "nontermination oracle (alt loop)",
+            lambda: recover_from_kind_oracle(
+                server_command=server_command,
+                userid=userid,
+                timeout_s=tuned_query_timeout,
+                program_source=TERMINATION_ORACLE_ALT_PROGRAM,
+                true_kinds={"timeout"},
+                false_kinds={"failure", "insecure"},
             ),
         ),
         (
